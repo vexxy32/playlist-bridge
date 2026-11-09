@@ -48,6 +48,16 @@ function App() {
     }
   }
 
+  async function disconnectSpotify() {
+    setMessage('')
+    try {
+      const response = await fetch('/api/logout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      if (!response.ok) throw new Error('logout')
+      setConnected(false)
+      setResult(null)
+    } catch { setMessage('Не удалось отключить Spotify. Проверь подключение к серверу.') }
+  }
+
   async function createPlaylist(event) {
     event.preventDefault()
     if (!connected || busy || readingFile) return
@@ -98,6 +108,7 @@ function App() {
             <h2>Подключи Spotify</h2>
             <p>{connected ? 'Аккаунт подключён. Теперь можно переходить к переносу.' : 'Войди через Spotify, чтобы подготовиться к переносу плейлиста.'}</p>
             <a className="spotify-button" href="/auth/spotify"><SpotifyIcon/> {connected ? 'Подключить другой аккаунт' : 'Подключить Spotify'} <span aria-hidden="true">↗</span></a>
+            {connected && <button type="button" onClick={disconnectSpotify} disabled={busy}>Отключить Spotify</button>}
             <span className="connect-note" id="connect-note" role="status"><span className="small-dot"/> {checking ? 'Проверяем подключение…' : serverError ? 'Запусти Go-сервер на 127.0.0.1:8080' : connected ? 'Spotify подключён' : authResult === 'denied' ? 'Доступ не предоставлен. Можно попробовать ещё раз.' : authResult === 'invalid' || authResult === 'failed' ? 'Не удалось подключиться. Попробуй ещё раз.' : 'Вход откроется на сайте Spotify'}</span>
           </div>
           <form className="transfer-card" onSubmit={createPlaylist}>

@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -33,12 +34,25 @@ type Server struct {
 	clientID, clientSecret string
 	client                 *http.Client
 	tokenURL               string
+	baseURL, redirectURL   string
+	secureCookies          bool
 	mu                     sync.Mutex
 	sessions               map[string]session
 }
 
 func New(clientID, clientSecret string) *Server {
-	return &Server{clientID: clientID, clientSecret: clientSecret, client: &http.Client{Timeout: 10 * time.Second}, tokenURL: "https://accounts.spotify.com/api/token", sessions: make(map[string]session)}
+	s, _ := NewWithBaseURL(clientID, clientSecret, "http://127.0.0.1:8080")
+	return s
+}
+
+// NewWithBaseURL настраивает публичный адрес сайта и адрес возврата Spotify.
+func NewWithBaseURL(clientID, clientSecret, baseURL string) (*Server, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || (u.Scheme != "https" && !(u.Scheme == "http" && u.Hostname() == "127.0.0.1")) {
+		return nil, fmt.Errorf("адрес сайта должен быть HTTPS или локальным http://127.0.0.1:порт")
+	}
+	origin := u.Scheme + "://" + u.Host
+	return &Server{clientID: clientID, clientSecret: clientSecret, client: &http.Client{Timeout: 10 * time.Second}, tokenURL: "https://accounts.spotify.com/api/token", baseURL: origin, redirectURL: origin + "/callback", secureCookies: u.Scheme == "https", sessions: make(map[string]session)}, nil
 }
 
 // Handler соединяет авторизацию и собранную страницу на одном адресе.
@@ -47,6 +61,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /auth/spotify", s.login)
 	mux.HandleFunc("GET /callback", s.callback)
 	mux.HandleFunc("GET /api/session", s.sessionStatus)
+	mux.HandleFunc("POST /api/logout", s.logout)
 	mux.HandleFunc("POST /api/transfer", s.transfer)
 	mux.Handle("/", http.FileServer(http.Dir("web/dist")))
 	return mux
@@ -70,7 +85,7 @@ func (s *Server) transfer(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)
 		_ = json.NewEncoder(w).Encode(result)
 	}
-	if origin := r.Header.Get("Origin"); origin != "" && origin != "http://127.0.0.1:8080" {
+	if origin := r.Header.Get("Origin"); origin != "" && origin != s.baseURL {
 		respond(http.StatusForbidden, transferResponse{Error: "Недопустимый адрес запроса"})
 		return
 	}
@@ -130,8 +145,8 @@ func randomString() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
-func setCookie(w http.ResponseWriter, name, value string, maxAge int) {
-	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: maxAge})
+func (s *Server) setCookie(w http.ResponseWriter, name, value string, maxAge int) {
+	http.SetCookie(w, &http.Cookie{Name: name, Value: value, Path: "/", HttpOnly: true, Secure: s.secureCookies, SameSite: http.SameSiteLaxMode, MaxAge: maxAge})
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -140,15 +155,15 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Не удалось начать подключение", http.StatusInternalServerError)
 		return
 	}
-	setCookie(w, "spotify_state", state, 600)
-	params := url.Values{"client_id": {s.clientID}, "response_type": {"code"}, "redirect_uri": {redirectURI}, "state": {state}, "scope": {"playlist-modify-private playlist-modify-public"}}
+	s.setCookie(w, "spotify_state", state, 600)
+	params := url.Values{"client_id": {s.clientID}, "response_type": {"code"}, "redirect_uri": {s.redirectURL}, "state": {state}, "scope": {"playlist-modify-private"}}
 	http.Redirect(w, r, "https://accounts.spotify.com/authorize?"+params.Encode(), http.StatusSeeOther)
 }
 
 func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 	stateCookie, err := r.Cookie("spotify_state")
 	state := r.URL.Query().Get("state")
-	setCookie(w, "spotify_state", "", -1)
+	s.setCookie(w, "spotify_state", "", -1)
 	if err != nil || state == "" || subtle.ConstantTimeCompare([]byte(stateCookie.Value), []byte(state)) != 1 {
 		http.Redirect(w, r, "/?auth=invalid", http.StatusSeeOther)
 		return
@@ -162,7 +177,7 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/?auth=failed", http.StatusSeeOther)
 		return
 	}
-	values := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {redirectURI}}
+	values := url.Values{"grant_type": {"authorization_code"}, "code": {code}, "redirect_uri": {s.redirectURL}}
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, s.tokenURL, strings.NewReader(values.Encode()))
 	if err != nil {
 		http.Redirect(w, r, "/?auth=failed", http.StatusSeeOther)
@@ -202,8 +217,28 @@ func (s *Server) callback(w http.ResponseWriter, r *http.Request) {
 		expiresAt:   now.Add(time.Duration(result.ExpiresIn) * time.Second),
 	}
 	s.mu.Unlock()
-	setCookie(w, "playlist_session", id, result.ExpiresIn)
+	s.setCookie(w, "playlist_session", id, result.ExpiresIn)
 	http.Redirect(w, r, "/?auth=connected", http.StatusSeeOther)
+}
+
+func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
+	if origin := r.Header.Get("Origin"); origin != "" && origin != s.baseURL {
+		http.Error(w, "Недопустимый адрес запроса", http.StatusForbidden)
+		return
+	}
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType != "application/json" {
+		http.Error(w, "Ожидается JSON", http.StatusUnsupportedMediaType)
+		return
+	}
+	if cookie, err := r.Cookie("playlist_session"); err == nil {
+		s.mu.Lock()
+		delete(s.sessions, cookie.Value)
+		s.mu.Unlock()
+	}
+	s.setCookie(w, "playlist_session", "", -1)
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) sessionToken(id string) (string, bool) {

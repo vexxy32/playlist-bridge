@@ -33,6 +33,9 @@ func TestSpotifyLoginAndCallback(t *testing.T) {
 	if err != nil || location.Host != "accounts.spotify.com" || location.Query().Get("state") == "" {
 		t.Fatal("invalid authorization redirect")
 	}
+	if location.Query().Get("scope") != "playlist-modify-private" {
+		t.Fatal("запрошены лишние разрешения")
+	}
 	stateCookie := login.Result().Cookies()[0]
 	callback := httptest.NewRequest(http.MethodGet, "/callback?code=test-code&state="+url.QueryEscape(location.Query().Get("state")), nil)
 	callback.AddCookie(stateCookie)
@@ -64,6 +67,89 @@ func TestSpotifyLoginAndCallback(t *testing.T) {
 	}
 	if strings.Contains(status.Body.String(), "test-token") || strings.Contains(status.Body.String(), "test-refresh") {
 		t.Fatal("token exposed")
+	}
+}
+
+func TestSessionsAreIsolatedAndLogoutOnlyRemovesCurrentSession(t *testing.T) {
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	var tokens []string
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		tokens = append(tokens, r.Header.Get("Authorization"))
+		body := `{"tracks":{"items":[{"name":"Song","uri":"spotify:track:1","artists":[{"name":"Artist"}]}]}}`
+		status := http.StatusOK
+		if r.URL.Path == "/v1/me/playlists" {
+			status = http.StatusCreated
+			body = `{"id":"playlist"}`
+		}
+		if r.URL.Path == "/v1/playlists/playlist/items" {
+			status = http.StatusCreated
+			body = `{}`
+		}
+		return &http.Response{StatusCode: status, Status: http.StatusText(status), Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	s := New("client", "secret")
+	s.sessions["first"] = session{accessToken: "token-first", expiresAt: time.Now().Add(time.Hour)}
+	s.sessions["second"] = session{accessToken: "token-second", expiresAt: time.Now().Add(time.Hour)}
+	for _, id := range []string{"first", "second"} {
+		tokens = nil
+		req := httptest.NewRequest(http.MethodPost, "/api/transfer", strings.NewReader(`{"name":"Test","tracks":[{"title":"Song","artist":"Artist"}]}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: "playlist_session", Value: id})
+		res := httptest.NewRecorder()
+		s.Handler().ServeHTTP(res, req)
+		if res.Code != http.StatusOK || len(tokens) != 3 {
+			t.Fatalf("%s: %d, %v", id, res.Code, tokens)
+		}
+		for _, token := range tokens {
+			if token != "Bearer token-"+id {
+				t.Fatalf("неверный токен для %s", id)
+			}
+		}
+	}
+	logout := httptest.NewRequest(http.MethodPost, "/api/logout", strings.NewReader(`{}`))
+	logout.Header.Set("Content-Type", "application/json")
+	logout.AddCookie(&http.Cookie{Name: "playlist_session", Value: "first"})
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, logout)
+	if res.Code != http.StatusNoContent {
+		t.Fatalf("logout: %d", res.Code)
+	}
+	if _, ok := s.sessionToken("first"); ok {
+		t.Fatal("первая сессия осталась")
+	}
+	if token, ok := s.sessionToken("second"); !ok || token != "token-second" {
+		t.Fatal("вторая сессия повреждена")
+	}
+	if cookies := res.Result().Cookies(); len(cookies) != 1 || cookies[0].MaxAge >= 0 {
+		t.Fatal("cookie не удалена")
+	}
+}
+
+func TestBaseURLAndSecureCookies(t *testing.T) {
+	if _, err := NewWithBaseURL("id", "secret", "http://example.com"); err == nil {
+		t.Fatal("небезопасный публичный HTTP принят")
+	}
+	s, err := NewWithBaseURL("id", "secret", "https://example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/auth/spotify", nil))
+	u, err := url.Parse(res.Header().Get("Location"))
+	if err != nil || u.Query().Get("redirect_uri") != "https://example.com/callback" {
+		t.Fatal("неверный redirect URI")
+	}
+	if cookies := res.Result().Cookies(); len(cookies) != 1 || !cookies[0].Secure {
+		t.Fatal("cookie должна требовать HTTPS")
+	}
+	logout := httptest.NewRequest(http.MethodPost, "/api/logout", nil)
+	logout.Header.Set("Origin", "https://evil.example")
+	logout.Header.Set("Content-Type", "application/json")
+	res = httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, logout)
+	if res.Code != http.StatusForbidden {
+		t.Fatal("чужой источник принят")
 	}
 }
 
