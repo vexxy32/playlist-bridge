@@ -1,0 +1,17 @@
+# Local credentials
+.env
+.env.*
+!.env.example
+
+# IDE settings and local builds
+.idea/
+*.exe
+
+# Frontend dependencies and build output
+web/node_modules/
+web/dist/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
