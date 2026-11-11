@@ -32,6 +32,113 @@ func TestSpotifySearchAdapter(t *testing.T) {
 	}
 }
 
+func TestSpotifySearchSharesQueriesAndMatchesEachTrack(t *testing.T) {
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	const filtered = "track:Song artist:Artist"
+	const broad = "Song Artist"
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		query := r.URL.Query().Get("q")
+		mu.Lock()
+		calls[query]++
+		mu.Unlock()
+		body := `{"tracks":{"items":[
+			{"name":"Song","uri":"solo","album":{"name":"Album"},"artists":[{"name":"Artist"}]},
+			{"name":"Song","uri":"compilation","album":{"name":"Collection"},"artists":[{"name":"Artist"}]}
+		]}}`
+		if query == broad {
+			body = `{"tracks":{"items":[
+				{"name":"Song","uri":"duet","album":{"name":"Album"},"artists":[{"name":"Artist"},{"name":"Guest"}]},
+				{"name":"Song","uri":"duet-compilation","album":{"name":"Collection"},"artists":[{"name":"Artist"},{"name":"Guest"}]}
+			]}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
+	})
+
+	tracks := []Track{
+		{Title: "Song", Artist: "Artist", Album: "Album"},
+		{Title: "Song", Artist: "Artist", Album: "Collection"},
+		{Title: "Song ft. Guest", Artist: "Artist", Album: "Album"},
+		{Title: "Song ft. Guest", Artist: "Artist", Album: "Collection"},
+	}
+	results, err := TransferTracks(context.Background(), tracks, SearchSpotify("token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantURIs := []string{"solo", "compilation", "duet", "duet-compilation"}
+	if got := collectFoundURIs(results); !reflect.DeepEqual(got, wantURIs) {
+		t.Fatalf("получены %v, ожидались %v", got, wantURIs)
+	}
+	if want := map[string]int{filtered: 1, broad: 1}; !reflect.DeepEqual(calls, want) {
+		t.Fatalf("запросы: %v, ожидались %v", calls, want)
+	}
+}
+
+func TestSpotifyBroadFirstCountsFallbackRequests(t *testing.T) {
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	var queries []string
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		query := r.URL.Query().Get("q")
+		queries = append(queries, query)
+		body := `{"tracks":{"items":[]}}`
+		if query == "track:Song artist:Artist" {
+			body = `{"tracks":{"items":[{"name":"Song","uri":"uri:song","artists":[{"name":"Artist"}]}]}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	search, stats := NewSpotifySearch("token", SpotifySearchBroadFirst)
+	results, err := TransferTracks(context.Background(), []Track{{Title: "Song", Artist: "Artist"}}, search)
+	if err != nil || len(results) != 1 || results[0].URI != "uri:song" {
+		t.Fatalf("результат: %+v, ошибка: %v", results, err)
+	}
+	if want := []string{"Song Artist", "track:Song artist:Artist"}; !reflect.DeepEqual(queries, want) {
+		t.Fatalf("запросы: %v, ожидались %v", queries, want)
+	}
+	if got := stats(); got != (SpotifySearchStats{FirstRequests: 1, FallbackRequests: 1, FallbackMatches: 1}) {
+		t.Fatalf("счётчики: %+v", got)
+	}
+}
+
+func TestSpotifyReusesOnlyUnambiguousAlbumCandidate(t *testing.T) {
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	var queries []string
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		query := r.URL.Query().Get("q")
+		queries = append(queries, query)
+		body := `{"tracks":{"items":[
+			{"name":"First","uri":"uri:first","album":{"name":"Album"},"artists":[{"name":"Artist"}]},
+			{"name":"Second","uri":"uri:second","album":{"name":"Album"},"artists":[{"name":"Artist"}]},
+			{"name":"Third","uri":"uri:third","album":{"name":"Album"},"artists":[{"name":"Artist"}]},
+			{"name":"Third","uri":"uri:other-edition","album":{"name":"Album"},"artists":[{"name":"Artist"}]}
+		]}}`
+		if query == "track:Third artist:Artist" {
+			body = `{"tracks":{"items":[{"name":"Third","uri":"uri:third","album":{"name":"Album"},"artists":[{"name":"Artist"}]}]}}`
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	search, stats := NewSpotifySearch("token", SpotifySearchReuseCandidates)
+	for _, tc := range []struct{ title, uri string }{
+		{"First", "uri:first"}, {"Second", "uri:second"}, {"Third", "uri:third"},
+	} {
+		track := Track{Title: tc.title, Artist: "Artist", Album: "Album"}
+		candidates, err := search(context.Background(), track)
+		got, found := selectCandidate(track, candidates)
+		if err != nil || !found || got.URI != tc.uri {
+			t.Fatalf("результат для %q: %+v, ошибка: %v", tc.title, got, err)
+		}
+	}
+	if want := []string{"track:First artist:Artist", "track:Third artist:Artist"}; !reflect.DeepEqual(queries, want) {
+		t.Fatalf("запросы: %v, ожидались %v", queries, want)
+	}
+	if got := stats(); got != (SpotifySearchStats{FirstRequests: 2, FirstMatches: 2, ReusedMatches: 1}) {
+		t.Fatalf("счётчики: %+v", got)
+	}
+}
+
 func TestTransferTracksUsesSelectedSearch(t *testing.T) {
 	tracks := []Track{{Title: "Numb", Artist: "Linkin Park", Album: "Meteora"}, {Title: "Missing", Artist: "Someone"}}
 	var calls []Track
@@ -74,6 +181,40 @@ func TestTransferTracksReportsSearchErrors(t *testing.T) {
 	}
 }
 
+func TestTransferTracksStopsWorkersOnSearchError(t *testing.T) {
+	want := errors.New("сервис недоступен")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var mu sync.Mutex
+	calls := 0
+	workersStarted := make(chan struct{})
+	search := func(ctx context.Context, track Track) ([]Candidate, error) {
+		mu.Lock()
+		calls++
+		if calls == 3 {
+			close(workersStarted)
+		}
+		mu.Unlock()
+		select {
+		case <-workersStarted:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if track.Title == "one" {
+			return nil, want
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	tracks := []Track{{Title: "one"}, {Title: "two"}, {Title: "three"}, {Title: "four"}}
+	if _, err := TransferTracks(ctx, tracks, search); !errors.Is(err, want) {
+		t.Fatalf("ожидалась исходная ошибка, получено %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("должны были запуститься только первые три поиска, запустилось %d", calls)
+	}
+}
+
 func TestSelectCandidateWithSeveralEditions(t *testing.T) {
 	track := Track{Title: "Breaking the Habit", Artist: "Linkin Park"}
 	candidates := []Candidate{
@@ -100,7 +241,7 @@ func TestSelectCandidateArtistAndVersion(t *testing.T) {
 		want       string
 		found      bool
 	}{
-		{"accent", Track{Title: "Numb / Encore", Artist: "JAY-Z"}, []Candidate{{Title: "Numb / Encore", Artists: []string{"JAŸ-Z", "Linkin Park"}, URI: "different"}}, "", false},
+		{"accent", Track{Title: "Numb / Encore", Artist: "JAY-Z"}, []Candidate{{Title: "Numb / Encore", Artists: []string{"JAŸ-Z", "Linkin Park"}, URI: "correct"}}, "correct", true},
 		{"transliteration", Track{Title: "Группа крови", Artist: "Кино"}, []Candidate{{Title: "Группа крови", Artists: []string{"Kino"}, URI: "different"}}, "", false},
 		{"spaces and case", Track{Title: " Song ", Artist: " ARTIST "}, []Candidate{{Title: "song", Artists: []string{"artist"}, URI: "correct"}}, "correct", true},
 		{"different punctuation", Track{Title: "A B", Artist: "Artist"}, []Candidate{{Title: "AB", Artists: []string{"Artist"}, URI: "different"}}, "", false},
@@ -109,6 +250,12 @@ func TestSelectCandidateArtistAndVersion(t *testing.T) {
 		{"remaster", Track{Title: "Numb", Artist: "Linkin Park"}, []Candidate{{Title: "Numb - 2011 Remastered", Artists: []string{"Linkin Park"}, URI: "correct"}}, "correct", true},
 		{"different remaster", Track{Title: "Song - 2011 Remaster", Artist: "Artist"}, []Candidate{{Title: "Song - 2021 Remaster", Artists: []string{"Artist"}, URI: "wrong"}}, "", false},
 		{"solo before duet", Track{Title: "Song", Artist: "Artist"}, []Candidate{{Title: "Song", Artists: []string{"Artist", "Other"}, URI: "duet"}, {Title: "Song", Artists: []string{"Artist"}, URI: "solo"}}, "solo", true},
+		{"guest must match", Track{Title: "Song ft. Guest", Artist: "Artist"}, []Candidate{{Title: "Song", Artists: []string{"Artist", "Other"}, URI: "wrong"}, {Title: "Song", Artists: []string{"Artist", "Guest"}, URI: "correct"}}, "correct", true},
+		{"version after guest is preserved", Track{Title: "Song ft. Guest", Artist: "Artist"}, []Candidate{{Title: "Song ft. Guest - Live", Artists: []string{"Artist", "Guest"}, URI: "live"}}, "", false},
+		{"original before cover", Track{Title: "Song", Artist: "Artist"}, []Candidate{{Title: "Song", Artists: []string{"Cover", "Artist"}, URI: "cover"}, {Title: "Song (feat. Guest)", Artists: []string{"Artist", "Guest"}, URI: "original"}}, "original", true},
+		{"secondary credit alone is not enough", Track{Title: "Song", Artist: "Artist"}, []Candidate{{Title: "Song", Artists: []string{"Cover", "Artist"}, URI: "cover"}}, "", false},
+		{"version spelling", Track{Title: "Song (Dance Mix) ft. Guest", Artist: "Artist"}, []Candidate{{Title: "Song", Artists: []string{"Artist", "Guest"}, URI: "original"}, {Title: "Song (feat. Guest) - Dance Mix", Artists: []string{"Artist", "Guest"}, URI: "mix"}}, "mix", true},
+		{"clean version requires confirmation", Track{Title: "Song (Clean Version)", Artist: "Artist"}, []Candidate{{Title: "Song", Artists: []string{"Artist"}, URI: "unknown"}}, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

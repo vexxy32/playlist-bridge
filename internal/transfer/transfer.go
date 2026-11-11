@@ -2,9 +2,7 @@ package transfer
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"regexp"
 	"strings"
 	"sync"
 )
@@ -25,11 +23,13 @@ type TransferResult struct {
 
 // Candidate — данные найденного трека в выбранном сервисе.
 type Candidate struct {
-	Title   string
-	Artists []string
-	Album   string
-	URI     string
+	Title    string
+	Artists  []string
+	Album    string
+	URI      string
+	Explicit *bool
 }
+
 type Playlist struct {
 	ID  string `json:"id"`
 	URI string `json:"uri"`
@@ -39,80 +39,6 @@ type Playlist struct {
 // SearchFunc ищет варианты трека. Функция должна допускать параллельные вызовы.
 type SearchFunc func(ctx context.Context, track Track) ([]Candidate, error)
 
-// ParseTracks читает входной JSON и превращает его в []Track.
-func ParseTracks(data []byte) ([]Track, error) {
-	var tracks []Track
-	if err := json.Unmarshal(data, &tracks); err != nil {
-		return nil, fmt.Errorf("повреждён JSON: %w", err)
-	}
-
-	for i, t := range tracks {
-		if strings.TrimSpace(t.Title) == "" {
-			return nil, fmt.Errorf("запись #%d: отсутствует обязательное поле title", i+1)
-		}
-		if strings.TrimSpace(t.Artist) == "" {
-			return nil, fmt.Errorf("запись #%d (%q): отсутствует обязательное поле artist", i+1, t.Title)
-		}
-	}
-
-	return tracks, nil
-}
-
-var remasterSuffix = regexp.MustCompile(`(?i)\s*(?:[-–—]\s*|[\(\[]\s*)(?:\d{4}\s+)?remaster(?:ed)?(?:\s+\d{4})?\s*[\)\]]?\s*$`)
-
-// selectCandidate допускает разные издания, но не подменяет название или исполнителя.
-func selectCandidate(track Track, candidates []Candidate) (Candidate, bool) {
-	wantTitle := strings.TrimSpace(track.Title)
-	explicitRemaster := remasterSuffix.MatchString(wantTitle)
-	wantArtist := strings.TrimSpace(track.Artist)
-	wantAlbum := strings.TrimSpace(track.Album)
-	if wantTitle == "" || wantArtist == "" {
-		return Candidate{}, false
-	}
-	bestScore := -1
-	var best Candidate
-	for _, c := range candidates {
-		if c.URI == "" {
-			continue
-		}
-		candidateTitle := strings.TrimSpace(c.Title)
-		exactTitle := strings.EqualFold(candidateTitle, wantTitle)
-		if !exactTitle {
-			baseTitle := strings.TrimSpace(remasterSuffix.ReplaceAllString(candidateTitle, ""))
-			if explicitRemaster || !strings.EqualFold(baseTitle, wantTitle) {
-				continue
-			}
-		}
-		artistIndex := -1
-		for i, a := range c.Artists {
-			if strings.EqualFold(strings.TrimSpace(a), wantArtist) {
-				artistIndex = i
-				break
-			}
-		}
-		if artistIndex < 0 {
-			continue
-		}
-		score := 0
-		if exactTitle {
-			score += 8
-		}
-		if artistIndex == 0 {
-			score++
-		}
-		if len(c.Artists) == 1 {
-			score += 2
-		}
-		if wantAlbum != "" && strings.EqualFold(strings.TrimSpace(c.Album), wantAlbum) {
-			score += 4
-		}
-		if score > bestScore {
-			best, bestScore = c, score
-		}
-	}
-	return best, bestScore >= 0
-}
-
 // TransferTracks ищет треки выбранной функцией поиска и сохраняет их порядок.
 func TransferTracks(ctx context.Context, tracks []Track, search SearchFunc) ([]TransferResult, error) {
 	if err := ctx.Err(); err != nil {
@@ -121,16 +47,18 @@ func TransferTracks(ctx context.Context, tracks []Track, search SearchFunc) ([]T
 	if search == nil {
 		return nil, fmt.Errorf("функция поиска не задана")
 	}
-	type searchResult struct {
-		candidates []Candidate
-		err        error
-	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	// Один запрос для повторяющихся входных записей; результаты сохраняют исходный порядок.
 	unique := make([]Track, 0, len(tracks))
 	lookup := make(map[Track]int, len(tracks))
 	indices := make([]int, len(tracks))
 	for i, track := range tracks {
-		key := Track{Title: strings.ToLower(strings.TrimSpace(track.Title)), Artist: strings.ToLower(strings.TrimSpace(track.Artist)), Album: strings.ToLower(strings.TrimSpace(track.Album))}
+		key := Track{
+			Title:  matchText(track.Title),
+			Artist: matchText(track.Artist),
+			Album:  matchText(track.Album),
+		}
 		index, ok := lookup[key]
 		if !ok {
 			index = len(unique)
@@ -139,7 +67,7 @@ func TransferTracks(ctx context.Context, tracks []Track, search SearchFunc) ([]T
 		}
 		indices[i] = index
 	}
-	responses := make([]searchResult, len(unique))
+	responses := make([][]Candidate, len(unique))
 	jobs := make(chan int, len(unique))
 	for i := range unique {
 		jobs <- i
@@ -154,21 +82,23 @@ func TransferTracks(ctx context.Context, tracks []Track, search SearchFunc) ([]T
 				if ctx.Err() != nil {
 					return
 				}
-				responses[i].candidates, responses[i].err = search(ctx, unique[i])
+				track := unique[i]
+				candidates, err := search(ctx, track)
+				if err != nil {
+					cancel(fmt.Errorf("ошибка поиска трека %q — %q: %w", track.Artist, track.Title, err))
+					return
+				}
+				responses[i] = candidates
 			}
 		}()
 	}
 	wg.Wait()
-	if err := ctx.Err(); err != nil {
+	if err := context.Cause(ctx); err != nil {
 		return nil, err
 	}
 	results := make([]TransferResult, len(tracks))
 	for i, track := range tracks {
-		response := responses[indices[i]]
-		if response.err != nil {
-			return nil, fmt.Errorf("ошибка поиска трека %q — %q: %w", track.Artist, track.Title, response.err)
-		}
-		chosen, found := selectCandidate(track, response.candidates)
+		chosen, found := selectCandidate(track, responses[indices[i]])
 		results[i] = TransferResult{Track: track, Found: found}
 		if found {
 			results[i].URI = chosen.URI
@@ -194,7 +124,14 @@ type CreateFunc func(ctx context.Context, name string) (Playlist, error)
 
 // CreateTransfer ищет треки, создаёт плейлист и добавляет найденные записи.
 // При ошибке добавления уже созданный плейлист остаётся в результате.
-func CreateTransfer(ctx context.Context, tracks []Track, name string, search SearchFunc, create CreateFunc, add AddFunc) (Playlist, []TransferResult, error) {
+func CreateTransfer(
+	ctx context.Context,
+	tracks []Track,
+	name string,
+	search SearchFunc,
+	create CreateFunc,
+	add AddFunc,
+) (Playlist, []TransferResult, error) {
 	if strings.TrimSpace(name) == "" {
 		return Playlist{}, nil, fmt.Errorf("укажи название плейлиста")
 	}

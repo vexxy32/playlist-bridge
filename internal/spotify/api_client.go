@@ -20,21 +20,35 @@ type tokenResponse struct {
 	AccessToken string `json:"access_token"`
 }
 
+// RateLimitError сообщает, на сколько секунд Spotify просит отложить запросы.
+type RateLimitError struct {
+	RetryAfterSeconds int
+}
+
+func (e *RateLimitError) Error() string {
+	if e.RetryAfterSeconds > 0 {
+		return fmt.Sprintf("Spotify ограничил частоту запросов: повтори через %d сек.", e.RetryAfterSeconds)
+	}
+	return "Spotify ограничил частоту запросов. Попробуй позже."
+}
+
 // Candidate — структура кандидата с данными, нужными для сравнения и добавления в плейлист.
 type Candidate struct {
-	Title   string
-	Artists []string
-	Album   string
-	URI     string
+	Title    string
+	Artists  []string
+	Album    string
+	URI      string
+	Explicit *bool
 }
 
 // Внутренняя структура под формат JSON самого Spotify.
 type searchResponse struct {
 	Tracks struct {
 		Items []struct {
-			Name  string `json:"name"`
-			URI   string `json:"uri"`
-			Album struct {
+			Name     string `json:"name"`
+			URI      string `json:"uri"`
+			Explicit *bool  `json:"explicit"`
+			Album    struct {
 				Name string `json:"name"`
 			} `json:"album"`
 			Artists []struct {
@@ -45,30 +59,30 @@ type searchResponse struct {
 }
 
 func GetToken(credentials Credentials) (string, error) {
-	data := url.Values{}
-	data.Set("grant_type", "client_credentials")
-	data.Set("client_id", credentials.ClientID)
-	data.Set("client_secret", credentials.ClientSecret)
+	formValues := url.Values{}
+	formValues.Set("grant_type", "client_credentials")
+	formValues.Set("client_id", credentials.ClientID)
+	formValues.Set("client_secret", credentials.ClientSecret)
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
 
-	response, err := client.PostForm(
+	resp, err := client.PostForm(
 		"https://accounts.spotify.com/api/token",
-		data,
+		formValues,
 	)
 	if err != nil {
 		return "", fmt.Errorf("отправить запрос токена: %w", err)
 	}
-	defer response.Body.Close()
+	defer resp.Body.Close()
 
-	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("Spotify вернул статус: %s", response.Status)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("Spotify вернул статус: %s", resp.Status)
 	}
 
 	var token tokenResponse
-	if err := json.NewDecoder(response.Body).Decode(&token); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
 		return "", fmt.Errorf("прочитать ответ Spotify: %w", err)
 	}
 
@@ -80,58 +94,26 @@ func GetToken(credentials Credentials) (string, error) {
 }
 
 func SearchTrack(ctx context.Context, token, title, artist string) ([]Candidate, error) {
-	params := url.Values{}
-	params.Set("q", "track:"+strings.TrimSpace(title)+" artist:"+strings.TrimSpace(artist))
-	params.Set("type", "track")
-	params.Set("limit", "10")
+	return SearchTrackQuery(ctx, token, TrackSearchQuery(title, artist))
+}
 
-	address := "https://api.spotify.com/v1/search?" + params.Encode()
+// TrackSearchQuery составляет поисковый запрос по названию и исполнителю.
+func TrackSearchQuery(title, artist string) string {
+	return "track:" + strings.TrimSpace(title) + " artist:" + strings.TrimSpace(artist)
+}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
-	if err != nil {
-		return nil, fmt.Errorf("создать запрос: %w", err)
-	}
-
-	request.Header.Set("Authorization", "Bearer "+token)
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
+// SearchTrackQuery выполняет поиск треков по готовому запросу Spotify.
+func SearchTrackQuery(ctx context.Context, token, query string) ([]Candidate, error) {
+	queryParams := url.Values{}
+	queryParams.Set("q", query)
+	queryParams.Set("type", "track")
+	queryParams.Set("limit", "10")
+	requestURL := "https://api.spotify.com/v1/search?" + queryParams.Encode()
 
 	var parsed searchResponse
-	for attempt := 0; ; attempt++ {
-		response, err := client.Do(request)
-		if err != nil {
-			return nil, fmt.Errorf("отправить запрос: %w", err)
-		}
-		if response.StatusCode == http.StatusTooManyRequests && attempt < 2 {
-			seconds, err := strconv.Atoi(response.Header.Get("Retry-After"))
-			response.Body.Close()
-			if err != nil || seconds < 1 {
-				seconds = 2
-			}
-			if seconds > 30 {
-				return nil, fmt.Errorf("Spotify ограничил частоту запросов: повтори через %d сек.", seconds)
-			}
-			timer := time.NewTimer(time.Duration(seconds) * time.Second)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return nil, ctx.Err()
-			case <-timer.C:
-			}
-			continue
-		}
-		if response.StatusCode != http.StatusOK {
-			response.Body.Close()
-			return nil, fmt.Errorf("Spotify вернул статус: %s", response.Status)
-		}
-		err = json.NewDecoder(response.Body).Decode(&parsed)
-		response.Body.Close()
-		if err != nil {
-			return nil, fmt.Errorf("прочитать ответ Spotify: %w", err)
-		}
-		break
+	err := getJSON(ctx, token, requestURL, &parsed)
+	if err != nil {
+		return nil, err
 	}
 
 	candidates := make([]Candidate, 0, len(parsed.Tracks.Items))
@@ -142,12 +124,43 @@ func SearchTrack(ctx context.Context, token, title, artist string) ([]Candidate,
 		}
 
 		candidates = append(candidates, Candidate{
-			Title:   item.Name,
-			Artists: artists,
-			Album:   item.Album.Name,
-			URI:     item.URI,
+			Title:    item.Name,
+			Artists:  artists,
+			Album:    item.Album.Name,
+			URI:      item.URI,
+			Explicit: item.Explicit,
 		})
 	}
 
 	return candidates, nil
+}
+
+var apiClient = &http.Client{Timeout: 10 * time.Second}
+
+func getJSON(ctx context.Context, token, requestURL string, result any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return fmt.Errorf("создать запрос: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("отправить запрос к Spotify: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		seconds, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
+		return &RateLimitError{RetryAfterSeconds: max(0, seconds)}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("Spotify вернул статус: %s", resp.Status)
+	}
+
+	err = json.NewDecoder(resp.Body).Decode(result)
+	if err != nil {
+		return fmt.Errorf("прочитать ответ Spotify: %w", err)
+	}
+	return nil
 }

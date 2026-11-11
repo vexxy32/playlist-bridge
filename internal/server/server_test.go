@@ -33,7 +33,7 @@ func TestSpotifyLoginAndCallback(t *testing.T) {
 	if err != nil || location.Host != "accounts.spotify.com" || location.Query().Get("state") == "" {
 		t.Fatal("invalid authorization redirect")
 	}
-	if location.Query().Get("scope") != "playlist-modify-private" {
+	if location.Query().Get("scope") != "playlist-modify-private playlist-read-private" {
 		t.Fatal("запрошены лишние разрешения")
 	}
 	stateCookie := login.Result().Cookies()[0]
@@ -115,10 +115,10 @@ func TestSessionsAreIsolatedAndLogoutOnlyRemovesCurrentSession(t *testing.T) {
 	if res.Code != http.StatusNoContent {
 		t.Fatalf("logout: %d", res.Code)
 	}
-	if _, ok := s.sessionToken("first"); ok {
+	if _, ok := s.sessionToken("first", "playlist_session"); ok {
 		t.Fatal("первая сессия осталась")
 	}
-	if token, ok := s.sessionToken("second"); !ok || token != "token-second" {
+	if token, ok := s.sessionToken("second", "playlist_session"); !ok || token != "token-second" {
 		t.Fatal("вторая сессия повреждена")
 	}
 	if cookies := res.Result().Cookies(); len(cookies) != 1 || cookies[0].MaxAge >= 0 {
@@ -243,6 +243,55 @@ func TestTransferEndpoint(t *testing.T) {
 	}
 }
 
+func TestYouTubeLinkCreatesSpotifyPlaylist(t *testing.T) {
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	var calls []string
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		status := http.StatusOK
+		var body string
+		switch r.URL.Path {
+		case "/youtube/v3/playlistItems":
+			if r.URL.Host != "www.googleapis.com" || r.URL.Query().Get("playlistId") != "PLexample" || r.URL.Query().Get("key") != "test-youtube-key" || r.Header.Get("Authorization") != "" {
+				t.Error("неверный запрос YouTube")
+			}
+			body = `{"items":[{"snippet":{"title":"Artist - Song (Official Video) ft. Guest","videoOwnerChannelTitle":"ArtistVEVO","resourceId":{"videoId":"video"}}}]}`
+		case "/v1/search":
+			if r.URL.Query().Get("q") != "track:Song artist:Artist" {
+				t.Errorf("неверный запрос Spotify: %s", r.URL.Query().Get("q"))
+			}
+			body = `{"tracks":{"items":[{"name":"Song","uri":"spotify:track:solo","artists":[{"name":"Artist"}]},{"name":"Song","uri":"spotify:track:duet","artists":[{"name":"Artist"},{"name":"Guest"}]}]}}`
+		case "/v1/me/playlists":
+			status = http.StatusCreated
+			body = `{"id":"abc123","uri":"spotify:playlist:abc123"}`
+		case "/v1/playlists/abc123/items":
+			status = http.StatusCreated
+			var data struct {
+				URIs []string `json:"uris"`
+			}
+			if json.NewDecoder(r.Body).Decode(&data) != nil || len(data.URIs) != 1 || data.URIs[0] != "spotify:track:duet" {
+				t.Errorf("неверные треки: %v", data.URIs)
+			}
+		default:
+			t.Errorf("неожиданный путь: %s", r.URL.Path)
+		}
+		return &http.Response{StatusCode: status, Status: http.StatusText(status), Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	s := New("client", "secret")
+	s.SetYouTubeAPIKey("test-youtube-key")
+	s.sessions["session"] = session{accessToken: "user-token", expiresAt: time.Now().Add(time.Hour)}
+	req := httptest.NewRequest(http.MethodPost, "/api/transfer", strings.NewReader(`{"name":"Test","youtubeUrl":"https://music.youtube.com/watch?v=video&list=PLexample&si=share"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "playlist_session", Value: "session"})
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+	var result transferResponse
+	if err := json.Unmarshal(res.Body.Bytes(), &result); err != nil || res.Code != http.StatusOK || result.Playlist.ID != "abc123" || len(result.Results) != 1 || !result.Results[0].Found || len(calls) != 4 {
+		t.Fatalf("ответ: %d %s, запросы: %v", res.Code, res.Body.String(), calls)
+	}
+}
+
 func TestTransferRequiresSessionAndRejectsCrossOrigin(t *testing.T) {
 	s := New("client", "secret")
 	req := httptest.NewRequest(http.MethodPost, "/api/transfer", strings.NewReader(`{}`))
@@ -257,6 +306,33 @@ func TestTransferRequiresSessionAndRejectsCrossOrigin(t *testing.T) {
 	s.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusForbidden {
 		t.Fatalf("чужой источник: %d", res.Code)
+	}
+}
+
+func TestTransferForwardsSpotifySearchRateLimit(t *testing.T) {
+	previous := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = previous })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/v1/search" {
+			t.Errorf("неожиданный запрос: %s", r.URL.Path)
+		}
+		return &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     http.Header{"Retry-After": []string{"45"}},
+			Body:       io.NopCloser(strings.NewReader("{}")),
+		}, nil
+	})
+
+	s := New("client", "secret")
+	s.sessions["session"] = session{accessToken: "token", expiresAt: time.Now().Add(time.Hour)}
+	req := httptest.NewRequest(http.MethodPost, "/api/transfer", strings.NewReader(`{"name":"Test","tracks":[{"title":"Song","artist":"Artist"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: "playlist_session", Value: "session"})
+	res := httptest.NewRecorder()
+	s.Handler().ServeHTTP(res, req)
+
+	if res.Code != http.StatusTooManyRequests || res.Header().Get("Retry-After") != "45" {
+		t.Fatalf("ответ: %d %v %s", res.Code, res.Header(), res.Body.String())
 	}
 }
 

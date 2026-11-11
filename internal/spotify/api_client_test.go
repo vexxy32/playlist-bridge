@@ -3,6 +3,7 @@ package spotify
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,17 +45,23 @@ func TestAddTrackBatchesInOrder(t *testing.T) {
 	}
 }
 
-func TestSearchTrackReportsLongRateLimit(t *testing.T) {
+func TestSearchTrackReportsRateLimitWithoutRetrying(t *testing.T) {
 	previous := http.DefaultTransport
 	t.Cleanup(func() { http.DefaultTransport = previous })
+	calls := 0
 	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
 		if r.URL.Query().Get("limit") != "10" {
 			t.Errorf("неверный размер поиска: %s", r.URL.RawQuery)
 		}
-		return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: http.Header{"Retry-After": []string{"45"}}, Body: io.NopCloser(strings.NewReader("{}"))}, nil
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests", Header: http.Header{"Retry-After": []string{"1"}}, Body: io.NopCloser(strings.NewReader("{}"))}, nil
 	})
 	_, err := SearchTrack(context.Background(), "token", "Song", "Artist")
-	if err == nil || !strings.Contains(err.Error(), "45") {
+	var rateLimit *RateLimitError
+	if !errors.As(err, &rateLimit) || rateLimit.RetryAfterSeconds != 1 {
 		t.Fatalf("ожидалось сообщение об ограничении: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("ожидался один запрос, получено %d", calls)
 	}
 }

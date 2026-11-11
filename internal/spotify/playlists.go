@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"time"
 )
 
 type Playlist struct {
@@ -29,41 +28,37 @@ type addTracksRequest struct {
 }
 
 func CreatePlaylist(ctx context.Context, token, name, description string, public bool) (Playlist, error) {
-	requestBody := createPlaylistRequest{
+	payload := createPlaylistRequest{
 		Name:        name,
 		Description: description,
 		Public:      public,
 	}
 
-	bodyBytes, err := json.Marshal(requestBody)
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return Playlist{}, fmt.Errorf("подготовить тело запроса: %w", err)
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.spotify.com/v1/me/playlists", bytes.NewBuffer(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.spotify.com/v1/me/playlists", bytes.NewReader(body))
 
 	if err != nil {
 		return Playlist{}, fmt.Errorf("создать запрос: %w", err)
 	}
 
-	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-	}
-
-	response, err := client.Do(request)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return Playlist{}, fmt.Errorf("отправить запрос: %w", err)
 	}
-	defer response.Body.Close()
+	defer resp.Body.Close()
 
-	if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK {
-		return Playlist{}, fmt.Errorf("Spotify вернул статус: %s", response.Status)
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return Playlist{}, fmt.Errorf("Spotify вернул статус: %s", resp.Status)
 	}
 	var playlist Playlist
-	if err := json.NewDecoder(response.Body).Decode(&playlist); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&playlist); err != nil {
 		return Playlist{}, fmt.Errorf("прочитать ответ Spotify: %w", err)
 	}
 	if playlist.ID == "" {
@@ -77,27 +72,26 @@ func AddTrack(ctx context.Context, token, playlistID string, uris []string) erro
 		return nil
 	}
 
-	address := "https://api.spotify.com/v1/playlists/" + url.PathEscape(playlistID) + "/items"
-	client := &http.Client{Timeout: 10 * time.Second}
+	requestURL := "https://api.spotify.com/v1/playlists/" + url.PathEscape(playlistID) + "/items"
 	for start := 0; start < len(uris); start += 100 {
 		end := min(start+100, len(uris))
-		bodyBytes, err := json.Marshal(addTracksRequest{URIs: uris[start:end]})
+		body, err := json.Marshal(addTracksRequest{URIs: uris[start:end]})
 		if err != nil {
 			return fmt.Errorf("подготовить тело запроса: %w", err)
 		}
-		request, err := http.NewRequestWithContext(ctx, http.MethodPost, address, bytes.NewBuffer(bodyBytes))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("создать запрос: %w", err)
 		}
-		request.Header.Set("Authorization", "Bearer "+token)
-		request.Header.Set("Content-Type", "application/json")
-		response, err := client.Do(request)
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := apiClient.Do(req)
 		if err != nil {
 			return fmt.Errorf("добавлено %d из %d треков; запрос: %w", start, len(uris), err)
 		}
-		response.Body.Close()
-		if response.StatusCode != http.StatusCreated && response.StatusCode != http.StatusOK {
-			return fmt.Errorf("добавлено %d из %d треков; Spotify вернул статус: %s", start, len(uris), response.Status)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("добавлено %d из %d треков; Spotify вернул статус: %s", start, len(uris), resp.Status)
 		}
 	}
 	return nil

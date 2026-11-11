@@ -29,7 +29,13 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	httpServer := &http.Server{Addr: "127.0.0.1:8080", Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second}
+	app.SetYouTubeAPIKey(os.Getenv("YOUTUBE_API_KEY"))
+	app.SetGoogleCredentials(os.Getenv("GOOGLE_CLIENT_ID"), os.Getenv("GOOGLE_CLIENT_SECRET"))
+	httpServer := &http.Server{
+		Addr:              "127.0.0.1:8080",
+		Handler:           app.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
 	log.Println("Открой http://127.0.0.1:8080/")
 	log.Fatal(httpServer.ListenAndServe())
 }
