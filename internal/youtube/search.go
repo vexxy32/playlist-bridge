@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"playlist-bridge/internal/providerhttp"
 )
 
 var playlistIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{2,128}$`)
@@ -91,7 +93,7 @@ func getPlaylistVideos(ctx context.Context, apiKey, token, playlistID string) ([
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
-		resp, err := apiClient.Do(req)
+		resp, err := providerhttp.Do(apiClient, req)
 		if err != nil {
 			return nil, fmt.Errorf("не удалось отправить запрос к YouTube")
 		}

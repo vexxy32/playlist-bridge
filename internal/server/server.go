@@ -96,6 +96,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/session", s.sessionStatus)
 	mux.HandleFunc("POST /api/logout", s.logout)
 	mux.HandleFunc("POST /api/transfer", s.transfer)
+	if !s.secureCookies {
+		mux.HandleFunc("GET /api/offline-tests", listOfflineTests)
+		mux.HandleFunc("POST /api/offline-tests/{id}", runOfflineTest)
+	}
 	mux.HandleFunc("POST /api/export/spotify", s.exportSpotify)
 	mux.HandleFunc("POST /api/export/youtube", s.exportYouTube)
 	mux.Handle("/", http.FileServer(http.Dir("web/dist")))
@@ -111,10 +115,16 @@ type transferRequest struct {
 	Destination        string          `json:"destination"`
 }
 
+type searchRequestStats struct {
+	Total    int `json:"total"`
+	Fallback int `json:"fallback,omitempty"`
+}
+
 type transferResponse struct {
-	Playlist transfer.Playlist         `json:"playlist"`
-	Results  []transfer.TransferResult `json:"results"`
-	Error    string                    `json:"error,omitempty"`
+	SearchRequests *searchRequestStats       `json:"searchRequests,omitempty"`
+	Playlist       transfer.Playlist         `json:"playlist"`
+	Results        []transfer.TransferResult `json:"results"`
+	Error          string                    `json:"error,omitempty"`
 }
 
 func (s *Server) transfer(w http.ResponseWriter, r *http.Request) {
@@ -181,7 +191,7 @@ func (s *Server) transfer(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		playlist, results, err := transfer.CopyYouTubePlaylist(r.Context(), accessToken, strings.TrimSpace(input.Name), videos, destination == "youtubeMusic")
-		result := transferResponse{Playlist: playlist, Results: results}
+		result := transferResponse{Playlist: playlist, Results: results, SearchRequests: &searchRequestStats{}}
 		if err != nil {
 			result.Error = err.Error()
 			respond(http.StatusBadGateway, result)
@@ -204,8 +214,10 @@ func (s *Server) transfer(w http.ResponseWriter, r *http.Request) {
 	var search transfer.SearchFunc
 	var create transfer.CreateFunc
 	var add transfer.AddFunc
+	var spotifyStats func() transfer.SpotifySearchStats
+	var readYouTubeRequests func() int
 	if destination == "spotify" {
-		search = transfer.SearchSpotify(accessToken)
+		search, spotifyStats = transfer.NewSpotifySearch(accessToken, transfer.SpotifySearchStandard)
 		create = transfer.CreateSpotify(accessToken)
 		add = transfer.AddToSpotify(accessToken)
 	} else {
@@ -213,12 +225,20 @@ func (s *Server) transfer(w http.ResponseWriter, r *http.Request) {
 			respond(http.StatusServiceUnavailable, transferResponse{Error: "Поиск YouTube не настроен"})
 			return
 		}
-		search = transfer.SearchYouTube(s.youtubeAPIKey)
+		search, readYouTubeRequests = transfer.NewYouTubeSearch(s.youtubeAPIKey)
 		create = transfer.CreateYouTube(accessToken, destination == "youtubeMusic")
 		add = transfer.AddToYouTube(accessToken)
 	}
 	playlist, results, err := transfer.CreateTransfer(r.Context(), tracks, input.Name, search, create, add)
-	result := transferResponse{Playlist: playlist, Results: results}
+	var requestStats searchRequestStats
+	if spotifyStats != nil {
+		stats := spotifyStats()
+		requestStats.Total = stats.FirstRequests + stats.FallbackRequests
+		requestStats.Fallback = stats.FallbackRequests
+	} else {
+		requestStats.Total = readYouTubeRequests()
+	}
+	result := transferResponse{Playlist: playlist, Results: results, SearchRequests: &requestStats}
 	if err != nil {
 		result.Error = err.Error()
 		if writeRetryAfter(w, err) {

@@ -3,24 +3,49 @@ package transfer
 import (
 	"context"
 	"fmt"
-	"html"
 	"net/url"
+	"sync"
+	"sync/atomic"
 
 	"playlist-bridge/internal/youtube"
 )
 
 // SearchYouTube преобразует найденные ролики в кандидатов для общего алгоритма.
 func SearchYouTube(apiKey string) SearchFunc {
-	return func(ctx context.Context, track Track) ([]Candidate, error) {
-		videos, err := youtube.SearchVideos(ctx, apiKey, track.Artist+" "+track.Title)
+	search, _ := NewYouTubeSearch(apiKey)
+	return search
+}
+
+// NewYouTubeSearch reports search attempts for a single transfer.
+func NewYouTubeSearch(apiKey string) (SearchFunc, func() int) {
+	var requests atomic.Int64
+	var mu sync.Mutex
+	queries := make(map[string]func() ([]youtube.Video, error))
+	search := func(ctx context.Context, track Track) ([]Candidate, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		query := track.Artist + " " + track.Title
+		mu.Lock()
+		lookup, ok := queries[query]
+		if !ok {
+			lookup = sync.OnceValues(func() ([]youtube.Video, error) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				requests.Add(1)
+				return youtube.SearchVideos(ctx, apiKey, query)
+			})
+			queries[query] = lookup
+		}
+		mu.Unlock()
+		videos, err := lookup()
 		if err != nil {
 			return nil, err
 		}
 		candidates := make([]Candidate, 0, len(videos))
 		for _, v := range videos {
-			v.Title = html.UnescapeString(v.Title)
-			v.ChannelTitle = html.UnescapeString(v.ChannelTitle)
-			parsed := videoTrack(v)
+			parsed := videoTrackForArtist(v, track.Artist)
 			candidates = append(candidates, Candidate{
 				Title:   parsed.Title,
 				Artists: []string{parsed.Artist},
@@ -29,6 +54,7 @@ func SearchYouTube(apiKey string) SearchFunc {
 		}
 		return candidates, nil
 	}
+	return search, func() int { return int(requests.Load()) }
 }
 
 func CreateYouTube(token string, music bool) CreateFunc {
@@ -55,11 +81,13 @@ func AddToYouTube(token string) AddFunc {
 func CopyYouTubePlaylist(ctx context.Context, token, name string, videos []youtube.Video, music bool) (Playlist, []TransferResult, error) {
 	results := make([]TransferResult, 0, len(videos))
 	for _, video := range videos {
-		results = append(results, TransferResult{
-			Track: videoTrack(video),
-			Found: video.VideoId != "",
-			URI:   video.VideoId,
-		})
+		track := videoTrack(video)
+		unavailable := track.unavailable || video.VideoId == ""
+		result := TransferResult{Track: track, Found: !unavailable, Unavailable: unavailable}
+		if !unavailable {
+			result.URI = video.VideoId
+		}
+		results = append(results, result)
 	}
 
 	videoIDs := collectFoundURIs(results)

@@ -1,0 +1,14 @@
+{
+  "Replace": {
+    "internal/server/account_sources_test.go": "tests/server/account_sources_test.go",
+    "internal/server/server_test.go": "tests/server/server_test.go",
+    "internal/server/spotify_export_test.go": "tests/server/spotify_export_test.go",
+    "internal/server/youtube_account_test.go": "tests/server/youtube_account_test.go",
+    "internal/server/youtube_export_test.go": "tests/server/youtube_export_test.go",
+    "internal/server/youtube_transfer_test.go": "tests/server/youtube_transfer_test.go",
+    "internal/spotify/api_client_test.go": "tests/spotify/api_client_test.go",
+    "internal/youtube/search_test.go": "tests/youtube/search_test.go",
+    "internal/transfer/transfer_test.go": "tests/transfer/transfer_test.go",
+    "internal/transfer/youtube_adapter_test.go": "tests/transfer/youtube_adapter_test.go"
+  }
+}

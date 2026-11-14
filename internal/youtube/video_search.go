@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+
+	"playlist-bridge/internal/providerhttp"
 )
 
 // SearchVideos ищет кандидатов в YouTube, не предполагая что каждый ролик — музыка.
@@ -23,7 +25,7 @@ func SearchVideos(ctx context.Context, apiKey, query string) ([]Video, error) {
 	if err != nil {
 		return nil, err
 	}
-	resp, err := apiClient.Do(req)
+	resp, err := providerhttp.Do(apiClient, req)
 	if err != nil {
 		return nil, fmt.Errorf("не удалось отправить запрос поиска к YouTube")
 	}

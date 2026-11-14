@@ -1,3 +1,5 @@
+//go:build playlist_bridge_tests
+
 package youtube
 
 import (

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+
+	"playlist-bridge/internal/providerhttp"
 )
 
 type Playlist struct {
@@ -48,7 +50,7 @@ func CreatePlaylist(ctx context.Context, token, name, description string, public
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := apiClient.Do(req)
+	resp, err := providerhttp.Do(apiClient, req)
 	if err != nil {
 		return Playlist{}, fmt.Errorf("отправить запрос: %w", err)
 	}
@@ -85,7 +87,7 @@ func AddTrack(ctx context.Context, token, playlistID string, uris []string) erro
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := apiClient.Do(req)
+		resp, err := providerhttp.Do(apiClient, req)
 		if err != nil {
 			return fmt.Errorf("добавлено %d из %d треков; запрос: %w", start, len(uris), err)
 		}

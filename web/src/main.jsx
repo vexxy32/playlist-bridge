@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import './style.css'
 
@@ -16,6 +16,10 @@ const quickRoutes = [
   { source: 'spotify', destination: 'youtubeMusic' },
   { source: 'youtubeMusic', destination: 'json' },
 ]
+
+function unavailableDestination(source) {
+  return source === 'file' ? 'json' : source
+}
 
 function storedChoice(key, options, fallback) {
   const value = sessionStorage.getItem(key)
@@ -83,6 +87,201 @@ function playlistLink(provider, id) {
   return 'https://' + host + '/playlist?list=' + encodeURIComponent(id)
 }
 
+function matchedTrackLink(destination, uri) {
+  const spotify = /^spotify:track:([a-zA-Z0-9]+)$/.exec(uri || '')
+  if (destination === 'spotify') return spotify ? 'https://open.spotify.com/track/' + spotify[1] : ''
+  if (!/^[a-zA-Z0-9_-]+$/.test(uri || '')) return ''
+  const host = destination === 'youtubeMusic' ? 'music.youtube.com' : 'www.youtube.com'
+  return 'https://' + host + '/watch?v=' + uri
+}
+
+function trackLabel(track) {
+  return [track.artist, track.title].filter(Boolean).join(' — ')
+}
+
+function TransferDetails({ results, destination, copyingVideos, offline = false }) {
+  const found = results.filter(item => item.found)
+  const missed = results.filter(item => !item.found && !item.unavailable && !item.pending)
+  const pending = results.filter(item => item.pending)
+  const unavailable = results.filter(item => item.unavailable)
+  const foundLabel = copyingVideos ? 'Доступно для копирования' : 'Подобрано'
+  const missedLabel = copyingVideos ? 'Не скопировано' : 'Не найдено'
+
+  return (
+    <>
+      <p>{foundLabel} {found.length} из {results.length}. {missedLabel} {missed.length}.{unavailable.length > 0 && <> Недоступных в источнике {unavailable.length}.</>}</p>
+      {found.length > 0 && (
+        <details className="result-list">
+          <summary>{copyingVideos ? 'Видео для копирования' : 'Найденные треки'} ({found.length})</summary>
+          <ol>
+            {found.map((item, index) => {
+              const label = trackLabel(item.match || item.track)
+              const url = offline ? "" : matchedTrackLink(destination, item.uri)
+              return (
+                <li key={index}>
+                  {url ? <a href={url} target="_blank" rel="noreferrer">{label} ↗</a> : label}
+                  {item.match && trackLabel(item.track) !== label && <small>Источник — {trackLabel(item.track)}</small>}
+                </li>
+              )
+            })}
+          </ol>
+        </details>
+      )}
+      {missed.length > 0 && (
+        <details className="result-list">
+          <summary>{missedLabel} ({missed.length})</summary>
+          <ul>{missed.map((item, index) => <li key={index}>{trackLabel(item.track)}</li>)}</ul>
+        </details>
+      )}
+      {pending.length > 0 && (
+        <details className="result-list" open>
+          <summary>Не проверены ({pending.length})</summary>
+          <ul>{pending.map((item, index) => <li key={index}>{trackLabel(item.track)}</li>)}</ul>
+        </details>
+      )}
+      {unavailable.length > 0 && (
+        <details className="result-list">
+          <summary>Недоступны в источнике ({unavailable.length})</summary>
+          <ul>{unavailable.map((item, index) => <li key={index}>{trackLabel(item.track)}</li>)}</ul>
+        </details>
+      )}
+    </>
+  )
+}
+
+function OfflineTests() {
+  const [scenarios, setScenarios] = useState([])
+  const [active, setActive] = useState(null)
+  const [progress, setProgress] = useState(null)
+  const [report, setReport] = useState(null)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch('/api/offline-tests', { signal: controller.signal })
+      .then(response => {
+        if (!response.ok) throw new Error('Не удалось загрузить сценарии.')
+        return response.json()
+      })
+      .then(setScenarios)
+      .catch(error => { if (!controller.signal.aborted) setError(error.message) })
+    return () => controller.abort()
+  }, [])
+
+  async function run(scenario) {
+    setActive(scenario)
+    setProgress(null)
+    setReport(null)
+    setError('')
+    try {
+      const response = await fetch('/api/offline-tests/' + encodeURIComponent(scenario.id) + '?progress=1', { method: 'POST' })
+      if (!response.ok || !response.body) throw new Error('Не удалось запустить сценарий.')
+
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+      let pending = ''
+      let finished = false
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          const lines = (pending + value).split('\n')
+          pending = lines.pop()
+          for (const line of lines) {
+            if (!line) continue
+            const event = JSON.parse(line)
+            if (event.call) setProgress(event)
+            if (event.report) {
+              setReport({ ...event.report, label: scenario.label })
+              finished = true
+            }
+          }
+        }
+        if (!finished) throw new Error('Сценарий завершился без отчёта.')
+      } finally {
+        await reader.cancel()
+      }
+    } catch (error) {
+      setError(error.message)
+    } finally {
+      setActive(null)
+    }
+  }
+
+  const counts = report?.calls.reduce((counts, call) => {
+    const operation = call.service + ' · ' + call.operation
+    counts.set(operation, (counts.get(operation) ?? 0) + 1)
+    return counts
+  }, new Map())
+
+  return (
+    <section className="panel offline-tests" aria-labelledby="offline-tests-heading">
+      <h2 id="offline-tests-heading">Офлайн-тесты переноса</h2>
+      <p className="form-hint">Фиксированные ответы API. Вход в аккаунты не нужен.</p>
+      <div className="offline-test-buttons">
+        {scenarios.map(scenario => (
+          <button className="account-action" type="button" key={scenario.id} disabled={Boolean(active)} onClick={() => run(scenario)}>
+            {active?.id === scenario.id ? 'Выполняется…' : scenario.label}
+          </button>
+        ))}
+      </div>
+      <div className="transfer-result">
+        {active && (
+          <>
+            <p id="offline-progress-label">Ответов от моков {progress?.completed ?? 0}{active.requests > 0 && <> из {active.requests}</>}</p>
+            <progress aria-labelledby="offline-progress-label" max={active.requests || undefined} value={active.requests > 0 ? Math.min(progress?.completed ?? 0, active.requests) : undefined}/>
+            {progress && <p>{progress.call.service} · {progress.call.operation} · {progress.call.status ? 'HTTP ' + progress.call.status : 'ошибка'}</p>}
+          </>
+        )}
+        {error && <p className="error-message" role="alert">{error}</p>}
+        {report && (
+          <>
+            <p role="status"><strong>{report.label}</strong> · {(report.elapsedMs / 1000).toFixed(1)} сек. с задержками моков</p>
+            <p>{report.comparison ? (report.passed ? 'Прогон завершён' : 'Ошибка прогона') : (report.passed ? 'Ожидания совпали' : 'Ожидания не совпали')} · HTTP {report.status}</p>
+            <p>Запросов к мокам {report.calls.length}, поисковых {report.searchRequests?.total ?? 0}, дополнительных {report.searchRequests?.fallback ?? 0}, повторов {report.retries}. Записано {report.written}.</p>
+            {counts.size > 0 && <p>{Array.from(counts, ([operation, count]) => operation + ' ' + count).join(' · ')}</p>}
+            {report.error && <p>{report.error}</p>}
+            {report.retryAfter && <p>Retry-After {report.retryAfter} сек.</p>}
+            {report.problems?.map(problem => <p className="error-message" key={problem}>{problem}</p>)}
+            {report.comparison && (
+              <>
+                <p>По разметке списка совпало {report.comparison.agreed}, разошлось {report.comparison.different}, спорных {report.comparison.review}.</p>
+                {report.comparison.details?.length > 0 && (
+                  <details className="result-list">
+                    <summary>Расхождения и спорные позиции</summary>
+                    <ul>
+                      {report.comparison.details.map(row => (
+                        <li key={row.position}>
+                          {row.position}. {row.source}
+                          <small>В списке — {row.expected}</small>
+                          <small>Результат — {row.actual}</small>
+                          {row.review && <small>{row.review}</small>}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </>
+            )}
+            {report.results && <TransferDetails results={report.results} destination={report.destination} offline/>}
+            <details className="result-list">
+              <summary>Журнал HTTP-запросов</summary>
+              <ol>
+                {report.calls.map((call, index) => (
+                  <li key={index}>
+                    {call.service} · {call.operation} · {call.status || 'ошибка'}
+                    {call.query && <small>{call.query}</small>}
+                    {call.hits && <small>{call.hits.length ? call.hits.join(' / ') : 'Пустая выдача'}</small>}
+                  </li>
+                ))}
+              </ol>
+            </details>
+          </>
+        )}
+      </div>
+    </section>
+  )
+}
+
 function PlatformIcon({ id }) {
   const shapes = {
     json: <g fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round"><path d="M6 3h8l4 4v14H6zM14 3v5h4M9 12h6m-6 4h6"/></g>,
@@ -109,25 +308,41 @@ function PlatformPicker({ label, options, selected, onSelect, disabledOption, bu
   )
 }
 
-function RouteArtwork({ source, destination }) {
+function RouteSummary({ source, destination }) {
   return (
-    <aside className="route-card" aria-label="Выбранный маршрут">
-      <div className="route-art" aria-hidden="true">
-        <svg className="art-lines" viewBox="0 0 420 300" preserveAspectRatio="xMidYMid slice" fill="none">
-          <path d="M-15 225C84 133 126 257 207 181S336 84 440 105M-15 239C84 147 126 271 207 195S336 98 440 119M-15 253C84 161 126 285 207 209S336 112 440 133M-15 267C84 175 126 299 207 223S336 126 440 147" stroke="currentColor" strokeWidth="1.3"/>
-        </svg>
-        <div className="record"><span>♪</span></div>
-        <span className="art-star">✳</span>
+    <section className="route-summary" aria-labelledby="route-summary-heading">
+      <h2 id="route-summary-heading">Твой маршрут</h2>
+      <div className="route-path" aria-live="polite">
+        <span><PlatformIcon id={source}/>{platforms[source]}</span>
+        <span className="route-arrow" aria-hidden="true">→</span>
+        <span><PlatformIcon id={destination}/>{platforms[destination]}</span>
       </div>
-      <div className="route-details">
-        <span className="eyebrow">ТВОЙ МАРШРУТ</span>
-        <div className="route-path" aria-live="polite">
-          <span><PlatformIcon id={source}/>{platforms[source]}</span>
-          <span className="route-arrow" aria-hidden="true">→</span>
-          <span><PlatformIcon id={destination}/>{platforms[destination]}</span>
-        </div>
-      </div>
-    </aside>
+    </section>
+  )
+}
+
+function SourceHelp({ source }) {
+  return (
+    <section className="panel source-help" aria-labelledby="source-help-heading">
+      <h2 id="source-help-heading">Что можно импортировать</h2>
+      {source === 'file' ? (
+        <>
+          <p>Для каждого трека укажи название <code>title</code> и исполнителя <code>artist</code>. Альбом <code>album</code> можно добавить для более точного подбора.</p>
+          <pre className="json-example"><code>{'[\n  {\n    "title": "Numb",\n    "artist": "Linkin Park",\n    "album": "Meteora"\n  }\n]'}</code></pre>
+          <p>Максимальный размер файла — 2 МБ.</p>
+        </>
+      ) : source === 'spotify' ? (
+        <>
+          <p>Подключи Spotify и нажми «Показать мои плейлисты». В списке могут быть свои, в том числе закрытые, и сохранённые чужие плейлисты.</p>
+          <p>Для переноса Spotify может ограничить чтение треков плейлистами, где ты владелец или соавтор. Также можно вставить ссылку на отдельный трек.</p>
+        </>
+      ) : (
+        <>
+          <p>Войди через Google и нажми «Показать мои плейлисты», чтобы выбрать плейлист своего канала, в том числе закрытый.</p>
+          <p>Для чужого публичного плейлиста вставь ссылку на него. Если копируешь ссылку из открытого ролика, проверь, что в ней есть параметр <code>list</code>.</p>
+        </>
+      )}
+    </section>
   )
 }
 
@@ -135,7 +350,7 @@ function App() {
   const [source, setSource] = useState(() => storedChoice('playlist-source', sources, 'file'))
   const [destination, setDestination] = useState(() => {
     const saved = storedChoice('playlist-destination', destinations, 'spotify')
-    if (source === saved || (source === 'file' && saved === 'json')) {
+    if (saved === unavailableDestination(source)) {
       return source === 'spotify' ? 'youtube' : 'spotify'
     }
     return saved
@@ -155,12 +370,14 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState(null)
   const [message, setMessage] = useState('')
+  const actionSlot = useRef(null)
+  const [actionFloating, setActionFloating] = useState(false)
   const authResult = new URLSearchParams(window.location.search).get('auth')
   const googleAuthResult = new URLSearchParams(window.location.search).get('google')
   const youtubeSource = source === 'youtube' || source === 'youtubeMusic'
   const googleDestination = destination === 'youtube' || destination === 'youtubeMusic'
   const jsonDestination = destination === 'json'
-  const availableDestinations = source === 'file' ? destinations.filter(id => id !== 'json') : destinations
+  const disabledDestination = unavailableDestination(source)
   const needsSpotify = source === 'spotify' || destination === 'spotify'
   const needsGoogle = googleDestination || (youtubeSource && selectedPlaylist !== null)
   const accountsReady = (!needsSpotify || connected) && (!needsGoogle || googleConnected)
@@ -182,9 +399,9 @@ function App() {
   }
 
   function selectSource(id) {
-    const options = id === 'file' ? destinations.filter(option => option !== 'json') : destinations
-    const next = id === destination || !options.includes(destination)
-      ? options.find(option => option !== id)
+    const disabled = unavailableDestination(id)
+    const next = destination === disabled
+      ? destinations.find(option => option !== disabled)
       : destination
     selectRoute(id, next)
   }
@@ -214,6 +431,15 @@ function App() {
       .then(data => setConnected(data.connected))
       .catch(() => setServerError(true))
       .finally(() => setChecking(false))
+  }, [])
+
+  useEffect(() => {
+    // Observe the button's original position, which stays in the form while it floats.
+    const observer = new IntersectionObserver(([entry]) => {
+      setActionFloating(entry.intersectionRatio < 1)
+    }, { threshold: 1 })
+    observer.observe(actionSlot.current)
+    return () => observer.disconnect()
   }, [])
 
   async function readFile(event) {
@@ -291,6 +517,7 @@ function App() {
   async function createPlaylist(event) {
     event.preventDefault()
     if (!accountsReady || busy || readingFile) return
+    if (actionFloating) actionSlot.current.scrollIntoView({ block: 'center' })
     if (jsonDestination) { await exportPlaylist(event); return }
     setMessage('')
     setResult(null)
@@ -354,36 +581,34 @@ function App() {
   }
 
   const copyingVideos = youtubeSource && googleDestination
-  const missed = result?.results?.filter(item => !item.found) || []
-  const matched = result?.results?.filter(item => item.found).length || 0
+
   const playlistURL = /^https:\/\/(?:open\.spotify\.com\/playlist\/[a-zA-Z0-9]+|(?:www\.youtube\.com|music\.youtube\.com)\/playlist\?list=[a-zA-Z0-9_-]+)(?:\?.*)?$/.test(result?.playlist?.url || '') ? result.playlist.url : ''
 
   return (
     <div className="app">
       <header className="header">
         <a className="brand" href="#home">
-          <span className="brand-icon" aria-hidden="true">♪</span>
-          <span>Playlist <span>Bridge</span></span>
+          <span className="brand-icon" aria-hidden="true">⇄</span>
+          <span>Playlist Bridge</span>
         </a>
-        <span className="header-note">Перенос плейлистов</span>
       </header>
 
       <main id="home">
         <div className="intro">
-          <h1>Твоя музыка.<br/><em>Новое место.</em></h1>
-          <p>Выбери, откуда и куда перенести плейлист.</p>
+          <h1>Переноси плейлисты<br className="hero-break"/> между сервисами</h1>
+          <p>Перенос между Spotify, YouTube и YouTube Music. Можно загрузить список треков или сохранить его в JSON.</p>
         </div>
 
         <div className="workspace">
           <div className="transfer-steps">
             <section className="panel" id="route-picker">
-              <div className="step-heading"><span aria-hidden="true">01</span><h2>Выбери маршрут</h2></div>
+              <h2 className="step-heading">Выбери маршрут</h2>
               <PlatformPicker label="Откуда" options={sources} selected={source} onSelect={selectSource} busy={busy}/>
-              <PlatformPicker label="Куда" options={availableDestinations} selected={destination} onSelect={id => selectRoute(source, id)} disabledOption={source} busy={busy}/>
+              <PlatformPicker label="Куда" options={destinations} selected={destination} onSelect={id => selectRoute(source, id)} disabledOption={disabledDestination} busy={busy}/>
             </section>
 
             <section className="panel">
-              <div className="step-heading"><span aria-hidden="true">02</span><h2>Подключи аккаунты</h2></div>
+              <h2 className="step-heading">Подключи аккаунты</h2>
               {needsSpotify && (
                 <div className="account-row">
                   <PlatformIcon id="spotify"/>
@@ -421,7 +646,7 @@ function App() {
             )}
 
             <form className="panel transfer-form" id="prepare-playlist" onSubmit={createPlaylist}>
-              <div className="step-heading"><span aria-hidden="true">03</span><h2>Подготовь плейлист</h2></div>
+              <h2 className="step-heading">Подготовь плейлист</h2>
               <p className="form-hint">{youtubeSource ? 'Выбери свой плейлист или вставь ссылку.' : source === 'spotify' ? 'Вставь ссылку на трек или выбери плейлист, где ты владелец или соавтор.' : 'Загрузи файл или вставь список треков в формате JSON.'}</p>
               {!jsonDestination && <><label className="field-label" htmlFor="playlist-name">Название плейлиста</label>
               <input id="playlist-name" value={playlistName} onChange={event => setPlaylistName(event.target.value)} maxLength="100" required/></>}
@@ -444,7 +669,13 @@ function App() {
                   <textarea id="tracks-json" value={tracksJSON} onChange={event => setTracksJSON(event.target.value)} rows="5" spellCheck="false" placeholder={'[\n  {"title": "Numb", "artist": "Linkin Park", "album": "Meteora"}\n]'} disabled={readingFile || busy} required/>
                 </>
               )}
-              <button className="primary-button" type="submit" disabled={!accountsReady || busy || readingFile || !(youtubeSource ? youtubeURL : source === 'spotify' ? spotifyURL : tracksJSON).trim()}>{busy ? 'Обрабатываем…' : jsonDestination ? 'Скачать JSON' : 'Перенести плейлист'} <span aria-hidden="true">↗</span></button>
+              <div className="transfer-action-slot" ref={actionSlot}>
+                <div className={actionFloating ? 'transfer-action transfer-action--floating' : 'transfer-action'}>
+                  <button className="primary-button" type="submit" disabled={!accountsReady || busy || readingFile || !(youtubeSource ? youtubeURL : source === 'spotify' ? spotifyURL : tracksJSON).trim()}>
+                    {busy ? 'Обрабатываем…' : jsonDestination ? 'Скачать JSON' : 'Перенести плейлист'} <span aria-hidden="true">↗</span>
+                  </button>
+                </div>
+              </div>
               {googleDestination && youtubeSource && (
                 <p className="form-hint route-hint">Видео копируются по порядку. В YouTube Music отображаются записи, которые сервис считает музыкальными.</p>
               )}
@@ -452,13 +683,18 @@ function App() {
               <div aria-live="polite" className="transfer-result">
                 {message && <p className={message === 'Файл с треками готов.' ? undefined : 'error-message'}>{message}</p>}
                 {result?.playlist?.id && <p>{result.error ? 'Плейлист уже создан. Проверь его перед повторной попыткой.' : 'Плейлист создан.'} {playlistURL ? <a href={playlistURL} target="_blank" rel="noreferrer">Открыть плейлист ↗</a> : `ID: ${result.playlist.id}`}</p>}
-                {result?.results && <p>{copyingVideos ? 'Доступно для копирования' : 'Подобрано'}: {matched} из {result.results.length}. {copyingVideos ? 'Недоступно' : 'Не найдено'}: {missed.length}.</p>}
-                {missed.length > 0 && <ul>{missed.map((item, index) => <li key={index}>{item.track.artist} — {item.track.title}</li>)}</ul>}
+                {result?.searchRequests && (
+                  <p>
+                    Поисковых запросов {result.searchRequests.total}
+                    {destination === 'spotify' && <> (дополнительных {result.searchRequests.fallback ?? 0})</>}.
+                  </p>
+                )}
+                {result?.results && <TransferDetails results={result.results} destination={destination} copyingVideos={copyingVideos}/>}
               </div>
             </form>
           </div>
-          <div className="route-sidebar">
-            <RouteArtwork source={source} destination={destination}/>
+          <aside className="route-sidebar" aria-label="Маршруты и подсказки">
+            <RouteSummary source={source} destination={destination}/>
             <section className="quick-routes" aria-labelledby="quick-routes-heading">
               <h2 id="quick-routes-heading">Быстрые маршруты</h2>
               {quickRoutes.map(route => (
@@ -478,7 +714,9 @@ function App() {
                 </button>
               ))}
             </section>
-          </div>
+            <SourceHelp source={source}/>
+            {['127.0.0.1', 'localhost'].includes(window.location.hostname) && <OfflineTests/>}
+          </aside>
         </div>
       </main>
 

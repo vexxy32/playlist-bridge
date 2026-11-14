@@ -2,6 +2,7 @@ package spotify
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,8 +11,10 @@ import (
 )
 
 type Song struct {
-	Type  string `json:"type"`
-	Title string `json:"name"`
+	Type       string `json:"type"`
+	Title      string `json:"name"`
+	DurationMs int    `json:"-"`
+	ISRC       string `json:"-"`
 
 	Artists []struct {
 		Name string `json:"name"`
@@ -19,6 +22,20 @@ type Song struct {
 	Album struct {
 		Name string `json:"name"`
 	} `json:"album"`
+}
+
+// UnmarshalJSON reads provider metadata without adding fields to Song's output JSON.
+func (s *Song) UnmarshalJSON(data []byte) error {
+	type songFields Song
+	wire := struct {
+		*songFields
+		trackMetadata
+	}{songFields: (*songFields)(s)}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	s.DurationMs, s.ISRC = wire.trackMetadata.DurationMs, wire.ExternalIDs.ISRC
+	return nil
 }
 
 func GetSong(ctx context.Context, token, trackID string) (Song, error) {

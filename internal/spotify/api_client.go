@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
+
+	"playlist-bridge/internal/providerhttp"
 )
 
 type Credentials struct {
@@ -22,10 +25,17 @@ type tokenResponse struct {
 
 // RateLimitError сообщает, на сколько секунд Spotify просит отложить запросы.
 type RateLimitError struct {
+	Reason            string
 	RetryAfterSeconds int
 }
 
 func (e *RateLimitError) Error() string {
+	if e.Reason == "QUOTA_EXCEEDED" {
+		if e.RetryAfterSeconds > 0 {
+			return fmt.Sprintf("Квота Spotify исчерпана. Повтори через %d сек.", e.RetryAfterSeconds)
+		}
+		return "Квота Spotify исчерпана."
+	}
 	if e.RetryAfterSeconds > 0 {
 		return fmt.Sprintf("Spotify ограничил частоту запросов: повтори через %d сек.", e.RetryAfterSeconds)
 	}
@@ -34,11 +44,20 @@ func (e *RateLimitError) Error() string {
 
 // Candidate — структура кандидата с данными, нужными для сравнения и добавления в плейлист.
 type Candidate struct {
-	Title    string
-	Artists  []string
-	Album    string
-	URI      string
-	Explicit *bool
+	Title      string
+	Artists    []string
+	Album      string
+	URI        string
+	Explicit   *bool
+	DurationMs int    `json:"-"`
+	ISRC       string `json:"-"`
+}
+
+type trackMetadata struct {
+	DurationMs  int `json:"duration_ms"`
+	ExternalIDs struct {
+		ISRC string `json:"isrc"`
+	} `json:"external_ids"`
 }
 
 // Внутренняя структура под формат JSON самого Spotify.
@@ -48,7 +67,8 @@ type searchResponse struct {
 			Name     string `json:"name"`
 			URI      string `json:"uri"`
 			Explicit *bool  `json:"explicit"`
-			Album    struct {
+			trackMetadata
+			Album struct {
 				Name string `json:"name"`
 			} `json:"album"`
 			Artists []struct {
@@ -124,15 +144,26 @@ func SearchTrackQuery(ctx context.Context, token, query string) ([]Candidate, er
 		}
 
 		candidates = append(candidates, Candidate{
-			Title:    item.Name,
-			Artists:  artists,
-			Album:    item.Album.Name,
-			URI:      item.URI,
-			Explicit: item.Explicit,
+			Title:      item.Name,
+			Artists:    artists,
+			Album:      item.Album.Name,
+			URI:        item.URI,
+			Explicit:   item.Explicit,
+			DurationMs: item.DurationMs,
+			ISRC:       item.ExternalIDs.ISRC,
 		})
 	}
 
 	return candidates, nil
+}
+
+type HTTPStatusError struct {
+	StatusCode int
+	Status     string
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("Spotify вернул статус: %s", e.Status)
 }
 
 var apiClient = &http.Client{Timeout: 10 * time.Second}
@@ -144,7 +175,7 @@ func getJSON(ctx context.Context, token, requestURL string, result any) error {
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 
-	resp, err := apiClient.Do(req)
+	resp, err := providerhttp.Do(apiClient, req)
 	if err != nil {
 		return fmt.Errorf("отправить запрос к Spotify: %w", err)
 	}
@@ -152,10 +183,16 @@ func getJSON(ctx context.Context, token, requestURL string, result any) error {
 
 	if resp.StatusCode == http.StatusTooManyRequests {
 		seconds, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
-		return &RateLimitError{RetryAfterSeconds: max(0, seconds)}
+		var body struct {
+			Error struct {
+				Reason string
+			}
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body)
+		return &RateLimitError{RetryAfterSeconds: max(0, seconds), Reason: body.Error.Reason}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("Spotify вернул статус: %s", resp.Status)
+		return &HTTPStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 	}
 
 	err = json.NewDecoder(resp.Body).Decode(result)

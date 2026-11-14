@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+
+	"playlist-bridge/internal/providerhttp"
 )
 
 func postJSON(ctx context.Context, token, endpoint string, payload any, result any) error {
@@ -20,7 +22,7 @@ func postJSON(ctx context.Context, token, endpoint string, payload any, result a
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := apiClient.Do(req)
+	resp, err := providerhttp.Do(apiClient, req)
 	if err != nil {
 		return fmt.Errorf("запрос к YouTube: %w", err)
 	}

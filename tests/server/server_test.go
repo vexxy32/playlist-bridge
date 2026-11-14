@@ -1,3 +1,5 @@
+//go:build playlist_bridge_tests
+
 package server
 
 import (
@@ -238,6 +240,12 @@ func TestTransferEndpoint(t *testing.T) {
 	if len(calls) != 3 {
 		t.Fatalf("запросы: %v", calls)
 	}
+	if result.SearchRequests == nil || result.SearchRequests.Total != 1 || result.SearchRequests.Fallback != 0 {
+		t.Fatalf("неверные счётчики: %+v", result.SearchRequests)
+	}
+	if match := result.Results[0].Match; match == nil || match.Title != "Numb" || match.Artist != "Linkin Park" {
+		t.Fatalf("неверное совпадение: %+v", match)
+	}
 	if strings.Contains(res.Body.String(), "user-token") {
 		t.Fatal("токен попал в ответ")
 	}
@@ -364,5 +372,154 @@ func TestTransferReturnsPlaylistWhenAddingFails(t *testing.T) {
 	var result transferResponse
 	if err := json.Unmarshal(res.Body.Bytes(), &result); err != nil || res.Code != http.StatusBadGateway || result.Playlist.ID != "created123" || result.Error == "" {
 		t.Fatalf("не сохранены данные созданного плейлиста: %d %s", res.Code, res.Body.String())
+	}
+}
+
+func TestOfflineTransferScenarios(t *testing.T) {
+	handler := New("", "").Handler()
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/offline-tests", nil))
+	var scenarios []struct {
+		ID, Label string
+		Requests  int
+	}
+	featured := fullOfflineFixtures()
+	if err := json.Unmarshal(list.Body.Bytes(), &scenarios); err != nil || list.Code != http.StatusOK ||
+		len(scenarios) != len(featured) {
+		t.Fatalf("список сценариев: HTTP %d, %s, %v", list.Code, list.Body.String(), err)
+	}
+	for i, scenario := range scenarios {
+		if scenario.ID != featured[i].id || scenario.Label != featured[i].label || scenario.Requests != featured[i].wantRequests {
+			t.Fatalf("неверная кнопка %d: %+v", i, scenario)
+		}
+	}
+	for _, fixture := range append(featured, offlineFixtures()...) {
+		t.Run(fixture.id, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/api/offline-tests/"+fixture.id, nil)
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+
+			var report offlineReport
+			if err := json.Unmarshal(res.Body.Bytes(), &report); err != nil {
+				t.Fatal(err)
+			}
+			if res.Code != http.StatusOK || !report.Passed {
+				t.Fatalf("HTTP %d: %+v, ошибка переноса %q", res.Code, report.Problems, report.Error)
+			}
+			if fixture.id == "holdout-youtube-spotify-320" {
+				c := report.Comparison
+				if c == nil || len(report.Results) != 320 || c.Agreed+c.Different+c.Review != 320 {
+					t.Fatalf("неполный результат контрольного набора: %+v", c)
+				}
+				t.Logf("контрольный набор: совпали %d, расхождения %d, спорные %d, записано %d, запросов %d, поиск %+v", c.Agreed, c.Different, c.Review, report.Written, len(report.Calls), report.SearchRequests)
+			}
+			if fixture.id == "user-youtube-spotify-320" {
+				c := report.Comparison
+				if c == nil || len(report.Results) != 320 || c.Agreed+c.Different+c.Review != 320 ||
+					c.Review != 6 || len(c.Details) != c.Different+c.Review || report.Retries != 2 {
+					t.Fatalf("неполный результат для плейлиста на 320 позиций: %+v, повторов %d", c, report.Retries)
+				}
+				for _, position := range []int{14, 15, 79, 136, 230, 231, 317} {
+					if !report.Results[position-1].Unavailable {
+						t.Errorf("позиция %d должна быть недоступна", position)
+					}
+				}
+				var pages, batches int
+				searchStatuses := make(map[string][]int)
+				for _, call := range report.Calls {
+					switch call.Operation {
+					case "Чтение":
+						pages++
+					case "Добавление":
+						batches++
+					case "Поиск":
+						searchStatuses[call.Query] = append(searchStatuses[call.Query], call.Status)
+					}
+				}
+				if pages != 7 || report.Written < 200 || batches != (report.Written+99)/100 {
+					t.Errorf("прочитано %d страниц, записано %d треков в %d пакетах", pages, report.Written, batches)
+				}
+				for _, failure := range []struct{ position, status int }{{12, 502}, {35, 429}} {
+					query := fixture.userPlaylist[failure.position-1].Query
+					got := searchStatuses[query]
+					if len(got) != 2 || got[0] != failure.status || got[1] != http.StatusOK {
+						t.Errorf("позиция %d: ожидался повтор после HTTP %d, получены статусы %v", failure.position, failure.status, got)
+					}
+				}
+				t.Logf("сравнение: %d совпало, %d разошлось, %d спорных; записано %d; HTTP-запросов %d, поисковых %+v", c.Agreed, c.Different, c.Review, report.Written, len(report.Calls), report.SearchRequests)
+			}
+			if fixture.id == "user-youtube-spotify" {
+				c := report.Comparison
+				if c == nil || len(report.Results) != 60 || c.Review != 3 ||
+					c.Agreed+c.Different+c.Review != len(report.Results) || len(c.Details) != c.Different+c.Review {
+					t.Fatalf("неполное сравнение с присланным списком: %+v", c)
+				}
+				for _, pair := range [][2]int{{0, 52}, {2, 18}} {
+					first, duplicate := report.Results[pair[0]], report.Results[pair[1]]
+					if first.URI == "" || first.URI != duplicate.URI {
+						t.Fatalf("потерян дубль в позициях %d и %d: %+v, %+v", pair[0]+1, pair[1]+1, first, duplicate)
+					}
+				}
+				if !report.Results[13].Unavailable || !report.Results[14].Unavailable {
+					t.Fatal("закрытое и удалённое видео должны быть недоступны")
+				}
+				// Verify the metadata fixes against IDs from the original mocked responses.
+				for _, position := range []int{8, 10, 18, 26, 28, 30, 31, 39, 45, 49, 56} {
+					row := fixture.userPlaylist[position-1]
+					result := report.Results[position-1]
+					if want := "spotify:track:" + row.Expected; !result.Found || result.URI != want {
+						t.Errorf("позиция %d (%q): получена запись %q, ожидалась %q", position, row.Title, result.URI, want)
+					}
+				}
+				for _, position := range []int{11, 13, 24, 60} {
+					result := report.Results[position-1]
+					if result.Found || result.Unavailable || result.Pending {
+						t.Errorf("позиция %d (%q): ожидался пропуск, получено %+v", position, result.Track.Title, result)
+					}
+				}
+				if got := report.Results[8]; got.Found && got.URI != "spotify:track:mock-009-a" {
+					t.Errorf("Hotel California: концерт заменён другой версией (%q)", got.URI)
+				}
+				t.Logf("сравнение: %d совпало, %d разошлось, %d спорных; записано %d; HTTP-запросов %d, поисковых %+v", c.Agreed, c.Different, c.Review, report.Written, len(report.Calls), report.SearchRequests)
+			}
+		})
+	}
+}
+
+func TestOfflineTransferStreamsProgress(t *testing.T) {
+	handler := New("", "").Handler()
+	for _, fixture := range fullOfflineFixtures() {
+		t.Run(fixture.id, func(t *testing.T) {
+			t.Parallel()
+			req := httptest.NewRequest(http.MethodPost, "/api/offline-tests/"+fixture.id+"?progress=1", nil)
+			res := httptest.NewRecorder()
+			handler.ServeHTTP(res, req)
+			if res.Code != http.StatusOK || res.Header().Get("Content-Type") != "application/x-ndjson" || !res.Flushed {
+				t.Fatalf("ответ потока: HTTP %d, %v", res.Code, res.Header())
+			}
+
+			decoder := json.NewDecoder(res.Body)
+			events := 0
+			for {
+				var event offlineProgress
+				if err := decoder.Decode(&event); err != nil {
+					t.Fatal(err)
+				}
+				if event.Report != nil {
+					if !event.Report.Passed || (fixture.wantRequests > 0 && events != fixture.wantRequests) || len(event.Report.Calls) != events || event.Report.ElapsedMs < 1 {
+						t.Fatalf("событий %d, результат %v, длительность %d мс", events, event.Report.Problems, event.Report.ElapsedMs)
+					}
+					t.Logf("%d HTTP-ответов за %d мс", events, event.Report.ElapsedMs)
+					break
+				}
+				events++
+				if event.Call == nil || event.Completed != events {
+					t.Fatalf("событие %d: %+v", events, event)
+				}
+			}
+			if err := decoder.Decode(&offlineProgress{}); err != io.EOF {
+				t.Fatalf("после отчёта ожидался конец потока, получено %v", err)
+			}
+		})
 	}
 }

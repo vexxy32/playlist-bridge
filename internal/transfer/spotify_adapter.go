@@ -2,9 +2,12 @@ package transfer
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"playlist-bridge/internal/spotify"
 )
@@ -38,6 +41,62 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 	var mu sync.Mutex
 	var stats SpotifySearchStats
 	queries := make(map[string]func() ([]Candidate, error))
+	// Keep at most one Spotify search in flight so every queued query observes Retry-After.
+	requestSlot := make(chan struct{}, 1)
+	var rateLimit *spotify.RateLimitError // Guarded by requestSlot.
+	request := func(ctx context.Context, query string, fallback bool) ([]spotify.Candidate, error) {
+		const maxRetryAfter = 5
+		const maxRetries = 2
+		select {
+		case requestSlot <- struct{}{}:
+			defer func() { <-requestSlot }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if rateLimit != nil {
+			return nil, rateLimit
+		}
+		for attempt := 0; ; attempt++ {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			mu.Lock()
+			if fallback {
+				stats.FallbackRequests++
+			} else {
+				stats.FirstRequests++
+			}
+			mu.Unlock()
+
+			found, err := spotify.SearchTrackQuery(ctx, token, query)
+			var limited *spotify.RateLimitError
+			var delay time.Duration
+			if errors.As(err, &limited) {
+				seconds := limited.RetryAfterSeconds
+				if limited.Reason == "QUOTA_EXCEEDED" || seconds <= 0 || seconds > maxRetryAfter || attempt >= maxRetries {
+					rateLimit = limited
+					return nil, err
+				}
+				delay = time.Duration(seconds) * time.Second
+			} else {
+				var status *spotify.HTTPStatusError
+				if attempt >= maxRetries || !errors.As(err, &status) ||
+					(status.StatusCode != http.StatusBadGateway &&
+						status.StatusCode != http.StatusServiceUnavailable &&
+						status.StatusCode != http.StatusGatewayTimeout) {
+					return found, err
+				}
+				delay = time.Duration(attempt+1) * 250 * time.Millisecond
+			}
+			timer := time.NewTimer(delay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			}
+		}
+	}
 	var knownCandidates map[Track]Candidate
 	if mode == SpotifySearchReuseCandidates {
 		knownCandidates = make(map[Track]Candidate)
@@ -49,18 +108,7 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 			stats.SharedQueries++
 		} else {
 			search = sync.OnceValues(func() ([]Candidate, error) {
-				if err := ctx.Err(); err != nil {
-					return nil, err
-				}
-				mu.Lock()
-				if fallback {
-					stats.FallbackRequests++
-				} else {
-					stats.FirstRequests++
-				}
-				mu.Unlock()
-
-				found, err := spotify.SearchTrackQuery(ctx, token, query)
+				found, err := request(ctx, query, fallback)
 				if err != nil {
 					return nil, err
 				}
@@ -79,9 +127,14 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 	}
 
 	search := func(ctx context.Context, track Track) ([]Candidate, error) {
-		title := parseTitle(track.Title).base
-		artist := cleanSpacing(track.Artist)
-		if title == "" || artist == "" {
+		parsedTitle := parseTitle(track.Title)
+		title := parsedTitle.base
+		for i := len(parsedTitle.versions) - 1; i >= 0; i-- {
+			title += " " + parsedTitle.versions[i]
+		}
+		primary := spotifyPrimaryArtist(track.Artist)
+		isrc := normalizeISRC(track.ISRC)
+		if isrc == "" && (title == "" || (primary == "" && track.videoSearchTitle == "")) {
 			return nil, nil
 		}
 		if knownCandidates != nil && matchText(track.Album) != "" {
@@ -89,7 +142,7 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 			mu.Lock()
 			candidate := knownCandidates[key]
 			mu.Unlock()
-			if candidate.URI != "" {
+			if candidate.URI != "" && (isrc == "" || isrc == normalizeISRC(candidate.ISRC)) {
 				candidates := []Candidate{candidate}
 				if _, matched := selectCandidate(track, candidates); matched {
 					mu.Lock()
@@ -100,12 +153,28 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 			}
 		}
 
-		primary, _, _ := strings.Cut(artist, ", ")
 		firstQuery := spotify.TrackSearchQuery(typography.Replace(title), typography.Replace(primary))
 		fallbackQuery := typography.Replace(title + " " + primary)
-		if mode == SpotifySearchBroadFirst {
+		if track.videoSearchTitle != "" {
+			if rawTitle := parseTitle(track.videoSearchTitle).base; rawTitle != "" {
+				fallbackQuery = typography.Replace(rawTitle)
+			}
+		}
+		// A YouTube title from an uploader can put the artist on either side.
+		// Let Spotify find both phrases before spending a request on the guessed order.
+		if mode == SpotifySearchBroadFirst || track.videoSearchTitle != "" {
 			firstQuery, fallbackQuery = fallbackQuery, firstQuery
 		}
+		if primary == "" || track.videoArtistAlias != "" {
+			firstQuery, fallbackQuery = typography.Replace(title), ""
+		}
+		if isrc != "" {
+			fallbackQuery, firstQuery = firstQuery, "isrc:"+isrc
+			if title == "" {
+				fallbackQuery = ""
+			}
+		}
+
 		candidates, err := searchQuery(ctx, firstQuery, false)
 		if err != nil {
 			return nil, err
@@ -114,6 +183,17 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 			mu.Lock()
 			stats.FirstMatches++
 			mu.Unlock()
+			return candidates, nil
+		}
+		if fallbackQuery == "" || fallbackQuery == firstQuery {
+			return candidates, nil
+		}
+		// A second text search needs some evidence for the requested artist.
+		// Keep the text lookup after an ISRC miss and the explicit broad-first mode.
+		if isrc == "" && mode != SpotifySearchBroadFirst &&
+			!slices.ContainsFunc(candidates, func(candidate Candidate) bool {
+				return artistIndex(primary, candidate.Artists) >= 0
+			}) {
 			return candidates, nil
 		}
 		found, err := searchQuery(ctx, fallbackQuery, true)
@@ -132,6 +212,16 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 		defer mu.Unlock()
 		return stats
 	}
+}
+
+func spotifyPrimaryArtist(artist string) string {
+	artist = bracketedFeature.ReplaceAllString(cleanSpacing(artist), "")
+	if feature := featureMarker.FindStringIndex(artist); feature != nil {
+		artist = artist[:feature[0]]
+	}
+	// Spotify's artist list is comma-separated. Keep ampersands and "and" in band names.
+	primary, _, _ := strings.Cut(artist, ",")
+	return parseTitle(primary).base
 }
 
 func albumCandidateKey(title, artist, album string) Track {
@@ -159,11 +249,13 @@ func spotifyCandidates(found []spotify.Candidate) []Candidate {
 	candidates := make([]Candidate, 0, len(found))
 	for _, item := range found {
 		candidates = append(candidates, Candidate{
-			Title:    item.Title,
-			Artists:  item.Artists,
-			Album:    item.Album,
-			URI:      item.URI,
-			Explicit: item.Explicit,
+			Title:      item.Title,
+			Artists:    item.Artists,
+			Album:      item.Album,
+			URI:        item.URI,
+			Explicit:   item.Explicit,
+			DurationMs: item.DurationMs,
+			ISRC:       item.ISRC,
 		})
 	}
 	return candidates
@@ -203,9 +295,11 @@ func TracksFromSpotify(songs []spotify.Song) []Track {
 			continue
 		}
 		tracks = append(tracks, Track{
-			Title:  song.Title,
-			Artist: strings.Join(artists, ", "),
-			Album:  song.Album.Name,
+			Title:      song.Title,
+			Artist:     strings.Join(artists, ", "),
+			Album:      song.Album.Name,
+			DurationMs: song.DurationMs,
+			ISRC:       song.ISRC,
 		})
 	}
 	return tracks
