@@ -24,7 +24,7 @@ type Song struct {
 	} `json:"album"`
 }
 
-// UnmarshalJSON reads provider metadata without adding fields to Song's output JSON.
+// UnmarshalJSON читает метаданные провайдера, не меняя формат JSON структуры Song.
 func (s *Song) UnmarshalJSON(data []byte) error {
 	type songFields Song
 	wire := struct {

@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"playlist-bridge/internal/providerhttp"
 	"regexp"
 	"strings"
-
-	"playlist-bridge/internal/providerhttp"
 )
 
 var playlistIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{2,128}$`)

@@ -1,3 +1,5 @@
+//go:build playlist_bridge_demo
+
 package server
 
 import (
@@ -68,8 +70,9 @@ func scaleYouTubeToSpotifyFixture() offlineFixture {
 		routes[appendRoute] = append(routes[appendRoute], offlineReply{status: 201, body: wireObject{"snapshot_id": "scale"}, wantWriteSize: min(100, len(expected)-offset)})
 	}
 	return offlineFixture{
-		id: "youtube-spotify-scale-300", label: "YouTube → Spotify · большой плейлист (300)",
-		source: "youtube", destination: "spotify", routes: routes, wantIDs: expected, wantStatus: 200,
+		id: "youtube-spotify-scale-300", label: "YouTube → Spotify · объём, дубли и недоступные видео (300)",
+		description: "Синтетический набор с повторяющимися названиями: страницы плейлиста, дубликаты и отсутствующие видео.",
+		source:      "youtube", destination: "spotify", routes: routes, wantIDs: expected, wantStatus: 200,
 		wantFound: len(expected), wantMissed: missed, wantUnavailable: unavailable, wantRequests: 6 + searches + 1 + len(routes[appendRoute]),
 	}
 }
@@ -114,8 +117,9 @@ func scaleSpotifyToYouTubeFixture() offlineFixture {
 		routes[spotifyRead(strconv.Itoa(start))] = []offlineReply{ok(songPage(next, songs[start:end]...))}
 	}
 	return offlineFixture{
-		id: "spotify-youtube-scale-300", label: "Spotify → YouTube · большой плейлист (300)",
-		source: "spotify", destination: "youtube", routes: withYouTubeWrites(len(expected), routes), wantIDs: expected, wantStatus: 200,
+		id: "spotify-youtube-scale-300", label: "Spotify → YouTube · объём, дубли и неподходящие версии (300)",
+		description: "Синтетический набор с повторяющимися названиями: дубликаты, замедленные версии и добавление видео по одному.",
+		source:      "spotify", destination: "youtube", routes: withYouTubeWrites(len(expected), routes), wantIDs: expected, wantStatus: 200,
 		wantFound: len(expected), wantMissed: missed, wantRequests: 6 + scaleFixtureSize - 24 + 1 + len(expected),
 	}
 }

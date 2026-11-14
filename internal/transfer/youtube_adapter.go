@@ -19,6 +19,7 @@ var topicSuffix = regexp.MustCompile(`(?i)\s+-\s+topic$`)
 var videoTrackNumber = regexp.MustCompile(`^\d{1,3}[.)]\s+`)
 var byCredit = regexp.MustCompile(`(?i)\s+by\s+`)
 var inlineLyrics = regexp.MustCompile(`(?i)\s*[-–—|~:]\s*(?:with\s+)?lyrics\s*[-–—|~:]\s*`)
+var soundtrackCredit = regexp.MustCompile(`(?i)\s+(?:from\s+)?(?:the\s+)?(?:original\s+)?(?:motion picture\s+)?[a-z]+\s+\d+\s+soundtrack\s*$`)
 var lyricsSuffix = regexp.MustCompile(`(?i)\s*(?:[-–—|~:+]\s*)?(?:\bwith\s+|\bw/\s*)?\blyrics(?:\s*(?:on screen|[+&]\s*hq sound))?[!.]*\s*$`)
 var uploadChannelSuffixes = []string{"music", "records", "lyrics", "vibes"}
 var videoCreditLabels = regexp.MustCompile("(?i)[(\\[]\\s*(?:(?:official\\s+)?(?:music video|lyric video|video|audio|(?:(?:color coded|with)\\s+|w/\\s*)?lyrics?(?:\\s*[+&]\\s*hq sound)?)|visuali[sz]er)\\s*[)\\]]")
@@ -56,11 +57,12 @@ func videoTrackForArtist(video youtube.Video, expectedArtist string) Track {
 	title = cleanSpacing(videoOnlyLabels.ReplaceAllString(title, " "))
 	title = videoTrackNumber.ReplaceAllString(title, "")
 	title = inlineLyrics.ReplaceAllString(title, " - ")
+	title = soundtrackCredit.ReplaceAllString(title, "")
 	if stripped := lyricsSuffix.ReplaceAllString(title, ""); stripped != "" {
 		title = stripped
 	}
 
-	// Some uploaders repeat their channel name before the artist and song.
+	// Некоторые загрузчики указывают название канала перед исполнителем и треком.
 	channelPrefix, remainder, hasColon := strings.Cut(title, ":")
 	hasUploaderPrefix := hasColon && sameArtist(channelPrefix, channel) &&
 		videoArtistSeparator.MatchString(strings.TrimSpace(remainder))
@@ -84,7 +86,7 @@ func videoTrackForArtist(video youtube.Video, expectedArtist string) Track {
 	separators := videoArtistSeparator.FindAllStringIndex(title, -1)
 	if len(separators) > 0 {
 		last := separators[len(separators)-1]
-		// A title can end in the artist or channel, even when it also starts with the artist.
+		// Название может заканчиваться исполнителем или каналом, даже если исполнитель указан в начале.
 		if suffix := title[last[1]:]; last[0] > 0 && !isVideoEdition(suffix) && (knownArtist(suffix) || sameArtist(suffix, channel)) {
 			if knownArtist(suffix) {
 				artist = suffix
@@ -107,7 +109,7 @@ func videoTrackForArtist(video youtube.Video, expectedArtist string) Track {
 		}
 	}
 
-	// For uploads from lyric channels or labels, use an explicit artist/title separator.
+	// Для роликов лейблов и каналов с текстами учитываем явный разделитель исполнителя и названия.
 	if expectedArtist == "" && channel == artist {
 		uploadChannel := hasVideoLabel || hasUploaderPrefix
 		for _, suffix := range uploadChannelSuffixes {

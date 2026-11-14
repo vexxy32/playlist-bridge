@@ -61,6 +61,24 @@ func TestVideoTrackArtistAndTitle(t *testing.T) {
 	}
 }
 
+func TestYouTubeMusicCreditsAndVideoLabels(t *testing.T) {
+	for _, tc := range []struct {
+		title, channel string
+		candidate      Candidate
+	}{
+		{"Artist - Song ft. Guest Film 7 Soundtrack", "Artist", Candidate{Title: "Song", Artists: []string{"Artist", "Guest"}, URI: "match"}},
+		{"Artist - Song (Vertical Video) ft. Guest", "Artist", Candidate{Title: "Song", Artists: []string{"Artist", "Guest"}, URI: "match"}},
+		{"Artist - Song [Official Dance Video]", "Label Records", Candidate{Title: "Song", Artists: []string{"Artist"}, URI: "match"}},
+	} {
+		t.Run(tc.title, func(t *testing.T) {
+			track := videoTrack(youtube.Video{Title: tc.title, ChannelTitle: tc.channel})
+			got, ok := selectCandidate(track, []Candidate{tc.candidate})
+			if !ok || got.URI != tc.candidate.URI {
+				t.Fatalf("track=%+v candidate=%+v got=%+v", track, tc.candidate, got)
+			}
+		})
+	}
+}
 func TestSearchYouTubeUsesExpectedArtistInVideoTitles(t *testing.T) {
 	previous := http.DefaultTransport
 	t.Cleanup(func() { http.DefaultTransport = previous })

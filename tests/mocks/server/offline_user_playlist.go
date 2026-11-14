@@ -1,7 +1,8 @@
+//go:build playlist_bridge_demo
+
 package server
 
 import (
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,18 +12,16 @@ import (
 	"playlist-bridge/internal/transfer"
 )
 
-//go:embed offline_user_playlist.json
-var userPlaylistData []byte
+var userPlaylistData = loadDemoFixture("offline_user_playlist.json")
 
-//go:embed offline_user_playlist_320.json
-var largeUserPlaylistData []byte
+var largeUserPlaylistData = loadDemoFixture("offline_user_playlist_320.json")
 
-//go:embed offline_holdout_playlist_320.json
-var holdoutUserPlaylistData []byte
+var holdoutUserPlaylistData = loadDemoFixture("offline_holdout_playlist_320.json")
 
 func holdoutUserPlaylistFixture() offlineFixture {
 	fixture := buildUserPlaylistFixture("holdout-youtube-spotify-320", holdoutUserPlaylistData, nil)
-	fixture.label = "YouTube → Spotify · контрольный набор (320)"
+	fixture.label = "YouTube → Spotify · сложные названия и версии (320)"
+	fixture.description = "Отдельный контрольный набор: разные языки, ремиксы, дубли релизов и недоступные записи. Часть случаев спорная."
 	return fixture
 }
 
@@ -49,11 +48,14 @@ const (
 )
 
 func userPlaylistFixture() offlineFixture {
-	return buildUserPlaylistFixture("user-youtube-spotify", userPlaylistData, nil)
+	fixture := buildUserPlaylistFixture("user-youtube-spotify", userPlaylistData, nil)
+	fixture.label = "YouTube → Spotify · лейблы и сложные случаи (60)"
+	fixture.description = "Подборка с названиями реальных песен: лейблы вместо артистов, версии, опечатки и намеренно неоднозначные случаи. Ответы Spotify вымышлены."
+	return fixture
 }
 
 func largeUserPlaylistFixture() offlineFixture {
-	return buildUserPlaylistFixture("user-youtube-spotify-320", largeUserPlaylistData, map[int]offlineReply{
+	fixture := buildUserPlaylistFixture("user-youtube-spotify-320", largeUserPlaylistData, map[int]offlineReply{
 		12: {
 			status: http.StatusBadGateway,
 			body:   wireObject{"error": wireObject{"status": 502, "message": "Bad Gateway"}},
@@ -63,6 +65,9 @@ func largeUserPlaylistFixture() offlineFixture {
 			body: wireObject{"error": wireObject{"status": 429, "message": "API rate limit exceeded"}},
 		},
 	})
+	fixture.label = "YouTube → Spotify · большая подборка и ошибки API (320)"
+	fixture.description = "Большая размеченная подборка с лейблами и версиями; также моделируются временные ответы 502 и 429."
+	return fixture
 }
 
 func buildUserPlaylistFixture(id string, data []byte, transientErrors map[int]offlineReply) offlineFixture {
@@ -76,7 +81,7 @@ func buildUserPlaylistFixture(id string, data []byte, transientErrors map[int]of
 	for i, row := range rows {
 		title := row.Title
 		if row.Expected == userPlaylistUnavailable {
-			// YouTube's API returns unavailable-video labels without brackets.
+			// YouTube API возвращает пометки недоступных видео без скобок.
 			title = strings.Trim(title, "[]")
 		}
 		videos = append(videos, sourceVideo(title, row.Channel, "user"+strconv.Itoa(i+1)))
@@ -91,8 +96,8 @@ func buildUserPlaylistFixture(id string, data []byte, transientErrors map[int]of
 			routes[route] = append(routes[route], userPlaylistSpotifyReply(row.First, false))
 		}
 	}
-	// Identical Spotify queries share one response. Prefer a first-search response
-	// to an optional fallback for a different row.
+	// Одинаковые запросы Spotify используют общий ответ. Предпочитаем ответ первого поиска
+	// необязательному повторному запросу для другого трека.
 	for _, row := range rows {
 		if row.FallbackQuery == "" {
 			continue

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"playlist-bridge/internal/providerhttp"
 )
 
 type PlaylistInfo struct {
@@ -32,7 +33,7 @@ func GetUserPlaylistsContext(ctx context.Context, token string) ([]PlaylistInfo,
 			return nil, fmt.Errorf("создать запрос: %w", err)
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := apiClient.Do(req)
+		resp, err := providerhttp.Do(apiClient, req)
 		if err != nil {
 			return nil, fmt.Errorf("получить плейлисты YouTube: %w", err)
 		}
@@ -103,7 +104,7 @@ func GetUserProfileContext(ctx context.Context, token string) (ProfileInfo, erro
 		return ProfileInfo{}, fmt.Errorf("создать запрос канала: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := apiClient.Do(req)
+	resp, err := providerhttp.Do(apiClient, req)
 	if err != nil {
 		return ProfileInfo{}, fmt.Errorf("получить канал YouTube: %w", err)
 	}

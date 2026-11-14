@@ -7,11 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"playlist-bridge/internal/providerhttp"
 	"strconv"
 	"strings"
 	"time"
-
-	"playlist-bridge/internal/providerhttp"
 )
 
 type Credentials struct {

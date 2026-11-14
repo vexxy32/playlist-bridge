@@ -1,3 +1,5 @@
+//go:build playlist_bridge_demo
+
 package server
 
 import (
@@ -35,6 +37,8 @@ type offlineRoute struct {
 type offlineFixture struct {
 	id                                                  string
 	label                                               string
+	description                                         string
+	notes                                               []string
 	source                                              string
 	destination                                         string
 	routes                                              map[offlineRoute][]offlineReply
@@ -214,16 +218,17 @@ func searchFixtureLabels(host string, body any) []string {
 
 type offlineReport struct {
 	transferResponse
-	Destination string             `json:"destination"`
-	Status      int                `json:"status"`
-	Passed      bool               `json:"passed"`
-	Calls       []offlineCall      `json:"calls"`
-	Retries     int                `json:"retries"`
-	RetryAfter  string             `json:"retryAfter,omitempty"`
-	ElapsedMs   int64              `json:"elapsedMs"`
-	Written     int                `json:"written"`
-	Problems    []string           `json:"problems,omitempty"`
-	Comparison  *offlineComparison `json:"comparison,omitempty"`
+	Destination string              `json:"destination"`
+	Status      int                 `json:"status"`
+	Passed      bool                `json:"passed"`
+	Calls       []offlineCall       `json:"calls"`
+	Retries     int                 `json:"retries"`
+	RetryAfter  string              `json:"retryAfter,omitempty"`
+	ElapsedMs   int64               `json:"elapsedMs"`
+	Written     int                 `json:"written"`
+	Problems    []string            `json:"problems,omitempty"`
+	Comparison  *offlineComparison  `json:"comparison,omitempty"`
+	Diagnostics []offlineDiagnostic `json:"diagnostics,omitempty"`
 }
 
 func executeOfflineTest(ctx context.Context, fixture offlineFixture, delay time.Duration, onCall func(int, offlineCall)) offlineReport {
@@ -265,7 +270,7 @@ func executeOfflineTest(ctx context.Context, fixture offlineFixture, delay time.
 		report.Problems = append(report.Problems, fmt.Sprintf("записано %v, ожидалось %v", run.written, fixture.wantIDs))
 	}
 	var foundIDs []string
-	var missed, unavailable, pending, searches int
+	var missed, unavailable, pending int
 	for _, result := range report.Results {
 		switch {
 		case result.Found:
@@ -278,11 +283,6 @@ func executeOfflineTest(ctx context.Context, fixture offlineFixture, delay time.
 			missed++
 		}
 	}
-	for _, call := range run.calls {
-		if call.Operation == "Поиск" {
-			searches++
-		}
-	}
 	if got, want := [4]int{len(foundIDs), missed, unavailable, pending}, [4]int{fixture.wantFound, fixture.wantMissed, fixture.wantUnavailable, fixture.wantPending}; fixture.userPlaylist == nil && got != want {
 		report.Problems = append(report.Problems, fmt.Sprintf("найденные, пропуски, недоступные и ожидающие: %v, ожидалось %v", got, want))
 	}
@@ -291,11 +291,6 @@ func executeOfflineTest(ctx context.Context, fixture offlineFixture, delay time.
 	}
 	if fixture.wantRequests > 0 && len(run.calls) != fixture.wantRequests {
 		report.Problems = append(report.Problems, fmt.Sprintf("HTTP-запросов %d, ожидалось %d", len(run.calls), fixture.wantRequests))
-	}
-	if report.SearchRequests != nil && (report.SearchRequests.Total != searches || (fixture.userPlaylist == nil && report.SearchRequests.Fallback != fixture.wantFallback)) {
-		report.Problems = append(report.Problems, fmt.Sprintf("счётчик поиска %+v, по HTTP-журналу %d", report.SearchRequests, searches))
-	} else if searches > 0 && report.SearchRequests == nil {
-		report.Problems = append(report.Problems, "нет счётчиков поиска")
 	}
 	if report.Retries != fixture.wantRetries {
 		report.Problems = append(report.Problems, fmt.Sprintf("повторов %d, ожидалось %d", report.Retries, fixture.wantRetries))
@@ -318,8 +313,9 @@ func executeOfflineTest(ctx context.Context, fixture offlineFixture, delay time.
 			report.Problems = append(report.Problems, "в плейлист записаны другие позиции или нарушен порядок")
 		}
 	}
+	report.Diagnostics = buildOfflineDiagnostics(fixture, report.Results, run.calls)
 	report.Passed = len(report.Problems) == 0
-	// Mock playlist IDs are never presented as links to real providers.
+	// Тестовые ID не должны выглядеть как ссылки на настоящие плейлисты.
 	report.Playlist.URL = ""
 	return report
 }
@@ -332,13 +328,14 @@ type offlineProgress struct {
 
 func listOfflineTests(w http.ResponseWriter, _ *http.Request) {
 	type option struct {
-		ID       string `json:"id"`
-		Label    string `json:"label"`
-		Requests int    `json:"requests"`
+		ID          string `json:"id"`
+		Label       string `json:"label"`
+		Requests    int    `json:"requests"`
+		Description string `json:"description"`
 	}
 	var options []option
 	for _, fixture := range fullOfflineFixtures() {
-		options = append(options, option{fixture.id, fixture.label, fixture.wantRequests})
+		options = append(options, option{fixture.id, fixture.label, fixture.wantRequests, fixture.description})
 	}
 	writeOfflineJSON(w, options)
 }

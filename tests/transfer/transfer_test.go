@@ -492,6 +492,14 @@ func TestSelectCandidateCorroboratesTitleQualifiers(t *testing.T) {
 		{"unverified curator prefix stays part of the credit", Track{Title: "Unknown Desk: Night Market ｜ Glass Orchard", Artist: "Archive Desk", fromYouTube: true}, []Candidate{
 			{Title: "Glass Orchard", Artists: []string{"Night Market"}, URI: "studio"},
 		}, ""},
+		{"label upload with artist last and corroborated guest", Track{Title: "Glass Orchard (with River Band) — Night Market [Клип]", Artist: "Archive Records", fromYouTube: true}, []Candidate{
+			{Title: "Glass Orchard", Artists: []string{"Night Market"}, URI: "solo"},
+			{Title: "Glass Orchard", Artists: []string{"Night Market", "River Band"}, URI: "joint"},
+		}, "joint"},
+		{"recording and rerecording stay distinct", Track{Title: "Glass Orchard / Night Market {HQ}", Artist: "Archive Records", fromYouTube: true}, []Candidate{
+			{Title: "Glass Orchard (Anniversary Re-recording)", Artists: []string{"Night Market"}, URI: "rerecording"},
+			{Title: "Glass Orchard", Artists: []string{"Night Market"}, URI: "studio"},
+		}, "studio"},
 		{"same-script subtitle stays part of the title", Track{Title: "Song (A Longer Subtitle)", Artist: "Artist", fromYouTube: true}, []Candidate{
 			{Title: "Song", Artists: []string{"Artist"}, URI: "other"},
 			{Title: "Song - A Longer Subtitle", Artists: []string{"Artist"}, URI: "full-title"},

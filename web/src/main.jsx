@@ -99,7 +99,24 @@ function trackLabel(track) {
   return [track.artist, track.title].filter(Boolean).join(' — ')
 }
 
-function TransferDetails({ results, destination, copyingVideos, offline = false }) {
+function OfflineTrackExplanation({ detail }) {
+  if (!detail || !Object.values(detail).some(Boolean)) return null
+  return (
+    <details className="offline-track-detail">
+      <summary>Почему такой результат?</summary>
+      {detail.source && <small>{detail.source}</small>}
+      {detail.expected && <small>{detail.expected}</small>}
+      {detail.explanation && <small>{detail.explanation}</small>}
+      {detail.searches?.map((search, index) => (
+        <small key={index}>
+          Запрос «{search.query}» · HTTP {search.status}. {search.status !== 200 ? 'Поиск вернул ошибку.' : search.hits?.length ? 'Выдача: ' + search.hits.join('; ') : 'Выдача пуста.'}
+        </small>
+      ))}
+    </details>
+  )
+}
+
+function TransferDetails({ results, destination, copyingVideos, offline = false, diagnostics = [] }) {
   const found = results.filter(item => item.found)
   const missed = results.filter(item => !item.found && !item.unavailable && !item.pending)
   const pending = results.filter(item => item.pending)
@@ -130,7 +147,12 @@ function TransferDetails({ results, destination, copyingVideos, offline = false 
       {missed.length > 0 && (
         <details className="result-list">
           <summary>{missedLabel} ({missed.length})</summary>
-          <ul>{missed.map((item, index) => <li key={index}>{trackLabel(item.track)}</li>)}</ul>
+          <ul>{missed.map((item, index) => (
+            <li key={index}>
+              {trackLabel(item.track)}
+              {offline && <OfflineTrackExplanation detail={diagnostics[results.indexOf(item)]}/>}
+            </li>
+          ))}</ul>
         </details>
       )}
       {pending.length > 0 && (
@@ -146,139 +168,6 @@ function TransferDetails({ results, destination, copyingVideos, offline = false 
         </details>
       )}
     </>
-  )
-}
-
-function OfflineTests() {
-  const [scenarios, setScenarios] = useState([])
-  const [active, setActive] = useState(null)
-  const [progress, setProgress] = useState(null)
-  const [report, setReport] = useState(null)
-  const [error, setError] = useState('')
-
-  useEffect(() => {
-    const controller = new AbortController()
-    fetch('/api/offline-tests', { signal: controller.signal })
-      .then(response => {
-        if (!response.ok) throw new Error('Не удалось загрузить сценарии.')
-        return response.json()
-      })
-      .then(setScenarios)
-      .catch(error => { if (!controller.signal.aborted) setError(error.message) })
-    return () => controller.abort()
-  }, [])
-
-  async function run(scenario) {
-    setActive(scenario)
-    setProgress(null)
-    setReport(null)
-    setError('')
-    try {
-      const response = await fetch('/api/offline-tests/' + encodeURIComponent(scenario.id) + '?progress=1', { method: 'POST' })
-      if (!response.ok || !response.body) throw new Error('Не удалось запустить сценарий.')
-
-      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
-      let pending = ''
-      let finished = false
-      try {
-        while (true) {
-          const { value, done } = await reader.read()
-          if (done) break
-          const lines = (pending + value).split('\n')
-          pending = lines.pop()
-          for (const line of lines) {
-            if (!line) continue
-            const event = JSON.parse(line)
-            if (event.call) setProgress(event)
-            if (event.report) {
-              setReport({ ...event.report, label: scenario.label })
-              finished = true
-            }
-          }
-        }
-        if (!finished) throw new Error('Сценарий завершился без отчёта.')
-      } finally {
-        await reader.cancel()
-      }
-    } catch (error) {
-      setError(error.message)
-    } finally {
-      setActive(null)
-    }
-  }
-
-  const counts = report?.calls.reduce((counts, call) => {
-    const operation = call.service + ' · ' + call.operation
-    counts.set(operation, (counts.get(operation) ?? 0) + 1)
-    return counts
-  }, new Map())
-
-  return (
-    <section className="panel offline-tests" aria-labelledby="offline-tests-heading">
-      <h2 id="offline-tests-heading">Офлайн-тесты переноса</h2>
-      <p className="form-hint">Фиксированные ответы API. Вход в аккаунты не нужен.</p>
-      <div className="offline-test-buttons">
-        {scenarios.map(scenario => (
-          <button className="account-action" type="button" key={scenario.id} disabled={Boolean(active)} onClick={() => run(scenario)}>
-            {active?.id === scenario.id ? 'Выполняется…' : scenario.label}
-          </button>
-        ))}
-      </div>
-      <div className="transfer-result">
-        {active && (
-          <>
-            <p id="offline-progress-label">Ответов от моков {progress?.completed ?? 0}{active.requests > 0 && <> из {active.requests}</>}</p>
-            <progress aria-labelledby="offline-progress-label" max={active.requests || undefined} value={active.requests > 0 ? Math.min(progress?.completed ?? 0, active.requests) : undefined}/>
-            {progress && <p>{progress.call.service} · {progress.call.operation} · {progress.call.status ? 'HTTP ' + progress.call.status : 'ошибка'}</p>}
-          </>
-        )}
-        {error && <p className="error-message" role="alert">{error}</p>}
-        {report && (
-          <>
-            <p role="status"><strong>{report.label}</strong> · {(report.elapsedMs / 1000).toFixed(1)} сек. с задержками моков</p>
-            <p>{report.comparison ? (report.passed ? 'Прогон завершён' : 'Ошибка прогона') : (report.passed ? 'Ожидания совпали' : 'Ожидания не совпали')} · HTTP {report.status}</p>
-            <p>Запросов к мокам {report.calls.length}, поисковых {report.searchRequests?.total ?? 0}, дополнительных {report.searchRequests?.fallback ?? 0}, повторов {report.retries}. Записано {report.written}.</p>
-            {counts.size > 0 && <p>{Array.from(counts, ([operation, count]) => operation + ' ' + count).join(' · ')}</p>}
-            {report.error && <p>{report.error}</p>}
-            {report.retryAfter && <p>Retry-After {report.retryAfter} сек.</p>}
-            {report.problems?.map(problem => <p className="error-message" key={problem}>{problem}</p>)}
-            {report.comparison && (
-              <>
-                <p>По разметке списка совпало {report.comparison.agreed}, разошлось {report.comparison.different}, спорных {report.comparison.review}.</p>
-                {report.comparison.details?.length > 0 && (
-                  <details className="result-list">
-                    <summary>Расхождения и спорные позиции</summary>
-                    <ul>
-                      {report.comparison.details.map(row => (
-                        <li key={row.position}>
-                          {row.position}. {row.source}
-                          <small>В списке — {row.expected}</small>
-                          <small>Результат — {row.actual}</small>
-                          {row.review && <small>{row.review}</small>}
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
-              </>
-            )}
-            {report.results && <TransferDetails results={report.results} destination={report.destination} offline/>}
-            <details className="result-list">
-              <summary>Журнал HTTP-запросов</summary>
-              <ol>
-                {report.calls.map((call, index) => (
-                  <li key={index}>
-                    {call.service} · {call.operation} · {call.status || 'ошибка'}
-                    {call.query && <small>{call.query}</small>}
-                    {call.hits && <small>{call.hits.length ? call.hits.join(' / ') : 'Пустая выдача'}</small>}
-                  </li>
-                ))}
-              </ol>
-            </details>
-          </>
-        )}
-      </div>
-    </section>
   )
 }
 
@@ -346,7 +235,147 @@ function SourceHelp({ source }) {
   )
 }
 
-function App() {
+function OfflineTests() {
+  const [scenarios, setScenarios] = useState([])
+  const [active, setActive] = useState(null)
+  const [progress, setProgress] = useState(null)
+  const [report, setReport] = useState(null)
+  const [error, setError] = useState('')
+  const [available, setAvailable] = useState(false)
+
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch('/api/offline-tests', { signal: controller.signal })
+      .then(response => {
+        if (!response.ok) throw new Error('Не удалось загрузить сценарии.')
+        return response.json()
+      })
+      .then(items => { setScenarios(items); setAvailable(true) })
+      .catch(() => {})
+    return () => controller.abort()
+  }, [])
+
+  async function run(scenario) {
+    setActive(scenario)
+    setProgress(null)
+    setReport(null)
+    setError('')
+    try {
+      const response = await fetch('/api/offline-tests/' + encodeURIComponent(scenario.id) + '?progress=1', { method: 'POST' })
+      if (!response.ok || !response.body) throw new Error('Не удалось запустить сценарий.')
+
+      const reader = response.body.pipeThrough(new TextDecoderStream()).getReader()
+      let pending = ''
+      let finished = false
+      try {
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          const lines = (pending + value).split('\n')
+          pending = lines.pop()
+          for (const line of lines) {
+            if (!line) continue
+            const event = JSON.parse(line)
+            if (event.call) setProgress(event)
+            if (event.report) {
+              setReport({ ...event.report, label: scenario.label })
+              finished = true
+            }
+          }
+        }
+        if (!finished) throw new Error('Сценарий завершился без отчёта.')
+      } finally {
+        await reader.cancel()
+      }
+    } catch (error) {
+      setError(error.message)
+    } finally {
+      setActive(null)
+    }
+  }
+
+  const counts = report?.calls.reduce((counts, call) => {
+    const operation = call.service + ' · ' + call.operation
+    counts.set(operation, (counts.get(operation) ?? 0) + 1)
+    return counts
+  }, new Map())
+
+  if (!available) return null
+
+  return (
+    <section className="panel offline-tests" aria-labelledby="offline-tests-heading">
+      <h2 id="offline-tests-heading">Офлайн-тесты переноса</h2>
+      <p className="form-hint">Фиксированные ответы API. Вход в аккаунты не нужен.</p>
+      <div className="offline-test-buttons">
+        {scenarios.map(scenario => (
+          <div className="offline-scenario" key={scenario.id}>
+            <button className="account-action" type="button" disabled={Boolean(active)} onClick={() => run(scenario)}>
+              {active?.id === scenario.id ? 'Выполняется…' : scenario.label}
+            </button>
+            {scenario.description && <p>{scenario.description}</p>}
+          </div>
+        ))}
+      </div>
+      <div className="transfer-result">
+        {active && (
+          <>
+            <p id="offline-progress-label">Ответов от моков {progress?.completed ?? 0}{active.requests > 0 && <> из {active.requests}</>}</p>
+            <progress aria-labelledby="offline-progress-label" max={active.requests || undefined} value={active.requests > 0 ? Math.min(progress?.completed ?? 0, active.requests) : undefined}/>
+            {progress && <p>{progress.call.service} · {progress.call.operation} · {progress.call.status ? 'HTTP ' + progress.call.status : 'ошибка'}</p>}
+          </>
+        )}
+        {error && <p className="error-message" role="alert">{error}</p>}
+        {report && (
+          <>
+            <p role="status"><strong>{report.label}</strong> · {(report.elapsedMs / 1000).toFixed(1)} сек. с задержками моков</p>
+            <p>{report.comparison ? (report.passed ? 'Прогон завершён' : 'Ошибка прогона') : (report.passed ? 'Ожидания совпали' : 'Ожидания не совпали')} · HTTP {report.status}</p>
+            <p>Запросов к мокам {report.calls.length}, поисковых {report.calls.filter(call => call.operation === "Поиск").length}, повторов {report.retries}. Записано {report.written}.</p>
+            {counts.size > 0 && <p>{Array.from(counts, ([operation, count]) => operation + ' ' + count).join(' · ')}</p>}
+            {report.error && <p>{report.error}</p>}
+            {report.retryAfter && <p>Retry-After {report.retryAfter} сек.</p>}
+            {report.problems?.map(problem => <p className="error-message" key={problem}>{problem}</p>)}
+            {report.comparison && (
+              <>
+                <p>По разметке сценария совпало {report.comparison.agreed}, разошлось {report.comparison.different}, спорных {report.comparison.review}. В расхождениях показаны ожидаемый и фактический результаты для одного исходного видео.</p>
+                {report.comparison.details?.length > 0 && (
+                  <details className="result-list">
+                    <summary>Расхождения и спорные позиции</summary>
+                    <ul>
+                      {report.comparison.details.map(row => (
+                        <li key={row.position}>
+                          {row.position}. {row.source}
+                          <small>Ожидалось по сценарию — {row.expected}</small>
+                          <small>Выбрал алгоритм — {row.actual}</small>
+                          {row.review && <small>{row.review}</small>}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </>
+            )}
+            {report.results && <TransferDetails results={report.results} destination={report.destination} diagnostics={report.diagnostics} offline/>}
+            <details className="result-list">
+              <summary>Журнал HTTP-запросов</summary>
+              <ol>
+                {report.calls.map((call, index) => (
+                  <li key={index}>
+                    {call.service} · {call.operation} · {call.status || 'ошибка'}
+                    {call.query && <small>{call.query}</small>}
+                    {call.hits && <small>{call.hits.length ? call.hits.join(' / ') : 'Пустая выдача'}</small>}
+                  </li>
+                ))}
+              </ol>
+            </details>
+          </>
+        )}
+      </div>
+    </section>
+  )
+}
+
+
+function TransferPage() {
   const [source, setSource] = useState(() => storedChoice('playlist-source', sources, 'file'))
   const [destination, setDestination] = useState(() => {
     const saved = storedChoice('playlist-destination', destinations, 'spotify')
@@ -683,12 +712,6 @@ function App() {
               <div aria-live="polite" className="transfer-result">
                 {message && <p className={message === 'Файл с треками готов.' ? undefined : 'error-message'}>{message}</p>}
                 {result?.playlist?.id && <p>{result.error ? 'Плейлист уже создан. Проверь его перед повторной попыткой.' : 'Плейлист создан.'} {playlistURL ? <a href={playlistURL} target="_blank" rel="noreferrer">Открыть плейлист ↗</a> : `ID: ${result.playlist.id}`}</p>}
-                {result?.searchRequests && (
-                  <p>
-                    Поисковых запросов {result.searchRequests.total}
-                    {destination === 'spotify' && <> (дополнительных {result.searchRequests.fallback ?? 0})</>}.
-                  </p>
-                )}
                 {result?.results && <TransferDetails results={result.results} destination={destination} copyingVideos={copyingVideos}/>}
               </div>
             </form>
@@ -715,7 +738,7 @@ function App() {
               ))}
             </section>
             <SourceHelp source={source}/>
-            {['127.0.0.1', 'localhost'].includes(window.location.hostname) && <OfflineTests/>}
+            {["127.0.0.1", "localhost"].includes(window.location.hostname) && <OfflineTests/>}
           </aside>
         </div>
       </main>
@@ -723,6 +746,74 @@ function App() {
       <footer className="footer"><span>Playlist Bridge</span><span>© 2026</span></footer>
     </div>
   )
+}
+
+function HomePage() {
+  return (
+    <div className="app landing">
+      <header className="header">
+        <a className="brand" href="#home">
+          <span className="brand-icon" aria-hidden="true">⇄</span>
+          <span>Playlist Bridge</span>
+        </a>
+        <a className="landing-nav" href="#transfer">Перенести плейлист <span aria-hidden="true">↗</span></a>
+      </header>
+
+      <main className="landing-main">
+        <section className="landing-hero">
+          <div className="landing-copy">
+            <p className="landing-eyebrow">Твоя музыка. Твой выбор.</p>
+            <h1>Плейлисты следуют за тобой</h1>
+            <p className="landing-lead">Переноси любимые треки между Spotify, YouTube и YouTube Music. Или сохрани список в JSON, чтобы вернуться к нему позже.</p>
+            <a className="landing-primary" href="#transfer">Начать перенос <span aria-hidden="true">↗</span></a>
+          </div>
+          <div className="landing-visual" aria-label="Поддерживаемые сервисы">
+            <div className="landing-visual-top"><span>Твоя музыка</span><span aria-hidden="true">✳</span></div>
+            <div className="landing-service"><PlatformIcon id="spotify"/><span>Spotify</span><span aria-hidden="true">↗</span></div>
+            <div className="landing-service"><PlatformIcon id="youtube"/><span>YouTube</span><span aria-hidden="true">↗</span></div>
+            <div className="landing-service"><PlatformIcon id="youtubeMusic"/><span>YouTube Music</span><span aria-hidden="true">↗</span></div>
+            <p className="landing-visual-caption">Выбери, откуда и куда перенести плейлист.</p>
+          </div>
+        </section>
+
+        <section className="landing-guide" aria-labelledby="landing-guide-title">
+          <div className="landing-guide-heading">
+            <h2 id="landing-guide-title">Как это работает</h2>
+            <p>Всего несколько шагов до нового плейлиста.</p>
+          </div>
+          <div className="landing-guide-grid">
+            <article><span className="landing-guide-icon" aria-hidden="true">⇄</span><h3>Выбери сервисы</h3><p>Укажи источник и место, куда хочешь перенести музыку.</p></article>
+            <article><span className="landing-guide-icon" aria-hidden="true">↗</span><h3>Подключи аккаунты</h3><p>Войди в необходимые сервисы и выбери плейлист или вставь ссылку.</p></article>
+            <article><span className="landing-guide-icon" aria-hidden="true">✓</span><h3>Проверь результат</h3><p>Открой новый плейлист и посмотри, какие треки удалось подобрать.</p></article>
+          </div>
+        </section>
+
+        <section className="landing-bottom">
+          <div><h2>Готов перенести музыку?</h2><p>Выбери маршрут и начни с любого доступного сервиса.</p></div>
+          <a className="landing-primary" href="#transfer">Начать перенос <span aria-hidden="true">↗</span></a>
+        </section>
+      </main>
+      <footer className="footer"><span>Playlist Bridge</span><span>© 2026</span></footer>
+    </div>
+  )
+}
+
+function App() {
+  const [route, setRoute] = useState(() => {
+    const params = new URLSearchParams(window.location.search)
+    return window.location.hash === '#transfer' || params.has('auth') || params.has('google') ? 'transfer' : 'home'
+  })
+
+  useEffect(() => {
+    function handleRoute() {
+      setRoute(window.location.hash === '#transfer' ? 'transfer' : 'home')
+      window.scrollTo(0, 0)
+    }
+    window.addEventListener('hashchange', handleRoute)
+    return () => window.removeEventListener('hashchange', handleRoute)
+  }, [])
+
+  return route === 'transfer' ? <TransferPage/> : <HomePage/>
 }
 
 createRoot(document.getElementById('root')).render(<App />)

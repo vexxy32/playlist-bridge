@@ -7,12 +7,12 @@ import (
 
 type transportKey struct{}
 
-// WithTransport scopes a replacement transport to one operation.
+// WithTransport задаёт подменный транспорт только для текущего запроса.
 func WithTransport(ctx context.Context, transport http.RoundTripper) context.Context {
 	return context.WithValue(ctx, transportKey{}, transport)
 }
 
-// Do uses the configured client, with an optional request-scoped transport.
+// Do выполняет запрос через обычный или заданный в контексте транспорт.
 func Do(client *http.Client, request *http.Request) (*http.Response, error) {
 	if transport, ok := request.Context().Value(transportKey{}).(http.RoundTripper); ok {
 		offline := *client

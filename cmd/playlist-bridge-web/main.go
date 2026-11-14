@@ -15,7 +15,7 @@ func main() {
 	_ = godotenv.Load()
 	clientID := strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_ID"))
 	clientSecret := strings.TrimSpace(os.Getenv("SPOTIFY_CLIENT_SECRET"))
-	if clientID == "" || clientSecret == "" {
+	if (clientID == "" || clientSecret == "") && !demoMode {
 		log.Fatal("Укажи SPOTIFY_CLIENT_ID и SPOTIFY_CLIENT_SECRET в .env")
 	}
 	if _, err := os.Stat("web/dist/index.html"); err != nil {

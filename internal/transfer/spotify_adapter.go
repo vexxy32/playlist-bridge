@@ -41,7 +41,7 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 	var mu sync.Mutex
 	var stats SpotifySearchStats
 	queries := make(map[string]func() ([]Candidate, error))
-	// Keep at most one Spotify search in flight so every queued query observes Retry-After.
+	// Выполняем поиск Spotify по одному запросу, чтобы очередь учитывала Retry-After.
 	requestSlot := make(chan struct{}, 1)
 	var rateLimit *spotify.RateLimitError // Guarded by requestSlot.
 	request := func(ctx context.Context, query string, fallback bool) ([]spotify.Candidate, error) {
@@ -160,8 +160,8 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 				fallbackQuery = typography.Replace(rawTitle)
 			}
 		}
-		// A YouTube title from an uploader can put the artist on either side.
-		// Let Spotify find both phrases before spending a request on the guessed order.
+		// В названии ролика исполнитель может стоять с любой стороны.
+		// Сначала ищем обе части вместе, не угадывая их порядок.
 		if mode == SpotifySearchBroadFirst || track.videoSearchTitle != "" {
 			firstQuery, fallbackQuery = fallbackQuery, firstQuery
 		}
@@ -188,8 +188,8 @@ func NewSpotifySearch(token string, mode SpotifySearchMode) (SearchFunc, func() 
 		if fallbackQuery == "" || fallbackQuery == firstQuery {
 			return candidates, nil
 		}
-		// A second text search needs some evidence for the requested artist.
-		// Keep the text lookup after an ISRC miss and the explicit broad-first mode.
+		// Для повторного текстового поиска нужны признаки нужного исполнителя.
+		// После неудачного поиска по ISRC и в режиме broad-first текстовый поиск сохраняется.
 		if isrc == "" && mode != SpotifySearchBroadFirst &&
 			!slices.ContainsFunc(candidates, func(candidate Candidate) bool {
 				return artistIndex(primary, candidate.Artists) >= 0
@@ -219,7 +219,7 @@ func spotifyPrimaryArtist(artist string) string {
 	if feature := featureMarker.FindStringIndex(artist); feature != nil {
 		artist = artist[:feature[0]]
 	}
-	// Spotify's artist list is comma-separated. Keep ampersands and "and" in band names.
+	// Исполнители Spotify разделены запятыми; символы & и and в названиях групп сохраняем.
 	primary, _, _ := strings.Cut(artist, ",")
 	return parseTitle(primary).base
 }

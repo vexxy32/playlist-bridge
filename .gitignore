@@ -15,3 +15,6 @@ web/dist/
 __pycache__/
 *.py[cod]
 .venv/
+
+# Локальные приватные данные — не добавлять в репозиторий
+tests/mocks/private/

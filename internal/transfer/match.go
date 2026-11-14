@@ -16,15 +16,16 @@ var featureSuffix = regexp.MustCompile(`[(\[]|\s+-\s+|[–—|]`)
 var artistSeparators = regexp.MustCompile(`(?i)\s*,\s*|\s+&\s+|\s+and\s+|\s+(?:x|vs\.?)\s+`)
 var cleanSuffix = regexp.MustCompile(`(?i)\s*(?:[-–—:|]\s*|[(\[]\s*)clean(?:\s+(?:ver\.?|version|edit))?\s*[)\]]?\s*$`)
 var explicitSuffix = regexp.MustCompile(`(?i)\s*(?:[-–—:|]\s*|[(\[]\s*)explicit(?:\s+(?:ver\.?|version|edit))?\s*[)\]]?\s*$`)
-var videoProductionCredit = regexp.MustCompile(`^(?:directed by .+|(?:official )?(?:studio )?(?:music )?(?:video|mv|movie)|video oficial|full song from .+|tiktok (?:19|20)\d{2} viral hit)$`)
+var videoProductionCredit = regexp.MustCompile(`^(?:directed by .+|(?:official )?(?:studio )?(?:music )?(?:video|mv|movie)|video oficial|official dance video|vertical video|a visual|us version|клип|音源|hq|original (?:audio|recording)|studio recording|archive upload|from the (?:archive|listening room)|full song from .+|tiktok (?:19|20)\d{2} viral hit)$`)
 var videoCreditSeparator = regexp.MustCompile(`\s+(?:-|/{1,2}|[•·])\s+|\s*[–—:|｜]\s*`)
-var trailingVideoCredit = regexp.MustCompile(`(?i)\s+(?:official\s+(?:music\s+)?(?:video|audio)|lyric\s+video)\s*$`)
+var videoBraceLabel = regexp.MustCompile(`(?i)\s+\{\s*HQ\s*\}`)
+var trailingVideoCredit = regexp.MustCompile(`(?i)\s+(?:official\s+(?:music\s+)?(?:video|audio)|lyric\s+video|archive upload|клип|音源)\s*$`)
 var bracketedWith = regexp.MustCompile(`(?i)^with\s+(.+)$`)
 var withCredit = regexp.MustCompile(`(?i)\s+(?:with|w[./])\s+`)
 var titleBrackets = regexp.MustCompile(`[(\[]([^()\[\]]+)[)\]]`)
 var titleSeparator = regexp.MustCompile(`\s+-\s+|\s*[–—:|]\s*`)
 var neutralTitleLabel = regexp.MustCompile(`^(?:single(?: version| edit)?|radio (?:edit|version|mix)|original (?:mix|version)|album version|official(?: (?:music video|audio|lyric video|video|hd video|4k video))?|(?:music|lyric|lyrics) video|lyrics|audio|hd|4k|(?:19|20)\d{2}|(?:original )?(?:motion picture )?soundtrack(?: version)?|ost|(?:ost|soundtrack) .+|(?:from|as featured in) .+|.+ (?:ost|soundtrack))$`)
-var versionWord = regexp.MustCompile(`\b(live|en vivo|remix|cover|instrumental|karaoke|acoustic|stripped|demo|speed up|sped up|slowed|nightcore)\b`)
+var versionWord = regexp.MustCompile(`\b(live|en vivo|remix|cover|re recording|rerecording|instrumental|karaoke|acoustic|stripped|demo|speed up|sped up|slowed|nightcore)\b`)
 var bareVersion = regexp.MustCompile(`^(live(?: (?:at|from|in|on) .+| version)?|remix(?: by .+)?|cover(?: by .+| version)?|instrumental(?: version)?|karaoke(?: version)?|(?:acoustic|stripped|demo)(?: version)?|speed up(?: version)?|sped up(?: version)?|slowed(?:(?: and)? reverb)?|nightcore)$`)
 var typography = strings.NewReplacer("’", "'", "‘", "'", "–", "-", "—", "-", "‑", "-", "…", "...")
 
@@ -107,7 +108,7 @@ func parseTitle(title string) trackTitle {
 	return parsed
 }
 
-// titleEdition extracts a trailing bracketed or delimited label.
+// titleEdition извлекает пометку версии в конце названия.
 func titleEdition(title string) (base, label string) {
 	end := len(title)
 	var bracketBase, bracketLabel string
@@ -162,6 +163,8 @@ func versionKinds(label string) []string {
 		switch word {
 		case "sped up", "nightcore":
 			word = "speed up"
+		case "re recording":
+			word = "rerecording"
 		case "en vivo":
 			word = "live"
 		}
@@ -173,7 +176,7 @@ func versionKinds(label string) []string {
 	return kinds
 }
 
-// matchVersions also handles bare suffixes, but only when they extend the other title.
+// matchVersions учитывает суффиксы версии, если они дополняют другое название.
 func matchVersions(want, got trackTitle, wantWords, gotWords []string) ([]string, []string, bool) {
 	wantLabel, gotLabel := strings.Join(wantWords, " "), strings.Join(gotWords, " ")
 	if extra, ok := strings.CutPrefix(gotLabel, wantLabel+" "); ok && isBareVersion(extra) {
@@ -198,7 +201,7 @@ func versionsMatch(left, right []string) bool {
 			matched := false
 			for _, other := range right {
 				other = strings.TrimSuffix(other, " version")
-				// A specific edition may match a generic label, but two named editions must agree.
+				// Общая пометка может совпасть с конкретной, но две разные версии должны совпадать.
 				if slices.Contains(versionKinds(other), kind) && (label == other ||
 					label == kind || other == kind || kind == "speed up" || kind == "slowed") {
 					matched = true
@@ -242,7 +245,7 @@ func titleSimilarity(want, got []string) float64 {
 	}
 	similarity := float64(common) / float64(union)
 	if similarity == 1 && len(want) == len(got) && len(want) > 2 {
-		// Identical sets can still describe different songs if the token order changes.
+		// Одинаковые слова в другом порядке могут обозначать разные песни.
 		return .78
 	}
 	if similarity == 1 {
@@ -372,6 +375,7 @@ func alternateScript(left, right string) bool {
 
 func withoutVideoProductionCredit(title string) string {
 	title = trailingVideoCredit.ReplaceAllString(title, "")
+	title = videoBraceLabel.ReplaceAllString(title, "")
 	return cleanSpacing(titleBrackets.ReplaceAllStringFunc(title, func(bracket string) string {
 		if title != bracket && videoProductionCredit.MatchString(strings.Join(titleWords(bracket), " ")) {
 			return " "
@@ -395,12 +399,12 @@ func normalizeVideoTitle(want, got trackTitle, album string) ([]string, []string
 	return wantWords, gotWords
 }
 
-// videoCredit finds a written artist credit supported by the candidate's artist list.
+// videoCredit ищет исполнителя из названия среди исполнителей кандидата.
 func videoCredit(title string, song []string, artists []string, channel string) (string, bool) {
 	if len(artists) == 0 {
 		return "", false
 	}
-	// Drop a curator prefix only when it identifies the upload channel.
+	// Убираем префикс только если он обозначает канал загрузки.
 	if prefix, rest, ok := strings.Cut(title, ":"); ok {
 		var initials strings.Builder
 		for i, r := range []rune(channel) {
@@ -424,6 +428,16 @@ func videoCredit(title string, song []string, artists []string, channel string) 
 			other := withoutVideoProductionCredit(parts[1-i])
 			if slices.Equal(withoutTitleArticle(titleWords(other)), withoutTitleArticle(song)) {
 				return other, true
+			}
+			creditText := strings.ReplaceAll(strings.ReplaceAll(other, " (", "  "), " [", "  ")
+			for _, marker := range withCredit.FindAllStringIndex(creditText, -1) {
+				// У кандидата должны быть участники, указанные в названии ролика.
+				guest := strings.Trim(other[marker[1]:], "()[] ")
+				base := strings.TrimRight(other[:marker[0]], " ([")
+				if slices.Equal(withoutTitleArticle(titleWords(base)), withoutTitleArticle(song)) &&
+					guestCreditsMatch([]string{guest}, artists) {
+					return base, true
+				}
 			}
 		}
 	}
@@ -474,7 +488,7 @@ func durationSimilarity(want, got int) float64 {
 	}
 }
 
-// embeddedVideoCredit compares the complete title with an artist and song in either order.
+// embeddedVideoCredit сравнивает название ролика с исполнителем и треком в любом порядке.
 func embeddedVideoCredit(video, song []string, artist string) bool {
 	videoText := strings.Join(video, " ")
 	artistText := strings.Join(titleWords(artist), " ")
@@ -496,9 +510,9 @@ func embeddedVideoCredit(video, song []string, artist string) bool {
 	return false
 }
 
-// selectCandidate compares each available signal against the acceptance threshold.
-// Using the weighted margin lets positive evidence improve the rank even when other
-// candidates are missing that field.
+// selectCandidate оценивает доступные признаки и выбирает кандидата выше порога.
+// Взвешенная оценка учитывает положительные признаки, даже если
+// у других кандидатов это поле отсутствует.
 func selectCandidate(track Track, candidates []Candidate) (Candidate, bool) {
 	const threshold = .80
 	want := parseTitle(track.Title)
@@ -582,7 +596,7 @@ func selectCandidate(track Track, candidates []Candidate) (Candidate, bool) {
 		}
 		title := titleSimilarity(wantBase, gotBase)
 		if sameRecording && matchingVersions {
-			// Provider recording IDs outweigh formatting, missing guests and release tags.
+			// Совпадение ID записи важнее различий оформления и пометок релиза.
 			score := title
 			if wantAlbum != "" && matchText(candidate.Album) == wantAlbum {
 				score += 1
@@ -606,7 +620,7 @@ func selectCandidate(track Track, candidates []Candidate) (Candidate, bool) {
 			mainIndex = 0
 		}
 		if mainIndex < 0 {
-			// YouTube can provide one combined artist credit in the video title.
+			// YouTube может указывать нескольких исполнителей одной строкой.
 			if len(artists) == 1 {
 				parsed := parseTitle(artists[0])
 				if sameArtist(artistCredit, parsed.base) {
@@ -618,7 +632,7 @@ func selectCandidate(track Track, candidates []Candidate) (Candidate, bool) {
 			mainIndex = artistIndex(artistCredit, artists)
 		}
 		if mainIndex > 0 && len(want.guests) == 0 {
-			// One named artist must be the primary credit, rather than a guest on a cover.
+			// Один из указанных исполнителей должен быть основным, а не гостем в кавере.
 			continue
 		}
 		if mainIndex < 0 {

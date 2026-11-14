@@ -16,7 +16,7 @@ func SearchYouTube(apiKey string) SearchFunc {
 	return search
 }
 
-// NewYouTubeSearch reports search attempts for a single transfer.
+// NewYouTubeSearch считает поисковые запросы одного переноса.
 func NewYouTubeSearch(apiKey string) (SearchFunc, func() int) {
 	var requests atomic.Int64
 	var mu sync.Mutex

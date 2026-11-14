@@ -1,0 +1,14 @@
+{
+  "Replace": {
+    "internal/server/offline.go": "tests/mocks/server/offline.go",
+    "internal/server/offline_data.go": "tests/mocks/server/offline_data.go",
+    "internal/server/offline_everyday_fixture.go": "tests/mocks/server/offline_everyday_fixture.go",
+    "internal/server/offline_fixtures.go": "tests/mocks/server/offline_fixtures.go",
+    "internal/server/offline_full_fixtures.go": "tests/mocks/server/offline_full_fixtures.go",
+    "internal/server/offline_scale_fixtures.go": "tests/mocks/server/offline_scale_fixtures.go",
+    "internal/server/offline_user_playlist.go": "tests/mocks/server/offline_user_playlist.go",
+    "internal/server/offline_demo_test.go": "tests/mocks/server/offline_demo_test.go",
+    "internal/server/offline_showcase.go": "tests/mocks/server/offline_showcase.go",
+    "internal/server/offline_diagnostics.go": "tests/mocks/server/offline_diagnostics.go"
+  }
+}
